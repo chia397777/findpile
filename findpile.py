@@ -1030,8 +1030,19 @@ def cmd_index(args):
             # 索引裡其他來源(例如從 Windows 複製過來的那一份)會因為
             # 在這台掃不到而被整批誤判成已刪除。
             # cloud 裡的檔案是「還在、只是沒下載」,不算消失。
+            #
+            # 最後那個 os.path.exists 是必要的,不是保險:
+            # walk() 只走 EXT_ALL(文件檔),圖片根本不在裡面,所以 here
+            # 永遠不含圖片路徑。而 ocr 指令寫進來的紀錄正好都是圖片 ——
+            # 少了這個檢查,跑一次 index 就會把整批 OCR 成果當成「不見了」
+            # 刪光。那可能是十幾個小時的辨識時間。
+            #
+            # 判定標準因此從「這次沒掃到」改成「磁碟上真的不存在」,
+            # 這也讓刪除行為整體更保守。多出來的 stat 呼叫只發生在
+            # 候選名單上,幾千筆不到一秒。
             gone += [p for p in known
-                     if p not in here and p not in cloud and _under(p, root)]
+                     if p not in here and p not in cloud and _under(p, root)
+                     and not os.path.exists(p)]
         found |= here
         roots_add(con, root)
 
