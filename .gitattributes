@@ -1,0 +1,27 @@
+# ─────────────────────────────────────────────────────────────
+#  換行字元必須鎖住,否則跨平台會壞掉
+# ─────────────────────────────────────────────────────────────
+# macOS 的 .command 若被轉成 CRLF,shebang 會變成 "#!/bin/bash\r",
+# 系統找不到這個解譯器,雙擊完全沒反應。
+# 預設一律 LF。下面的 .bat / .cmd 會覆寫掉這條。
+# 沒有這條的話，日後新增一個沒副檔名的 shell script
+# （git hook、install、run）或 .zsh，在 core.autocrlf=true 的機器上
+# 會被轉成 CRLF，macOS 雙擊完全沒反應。
+*          text=auto eol=lf
+
+*.command  text eol=lf
+*.sh       text eol=lf
+*.zsh      text eol=lf
+*.bash     text eol=lf
+
+# Windows 批次檔相反:cmd.exe 處理多行 if/else 區塊時,
+# LF-only 的換行會解析錯誤,必須是 CRLF。
+*.bat      text eol=crlf
+*.cmd      text eol=crlf
+
+# 其餘一律 LF
+*.py       text eol=lf
+*.md       text eol=lf
+*.json     text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf

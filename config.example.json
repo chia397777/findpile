@@ -1,0 +1,26 @@
+{
+  "_說明": "複製成 config.json 再改。config.json 不進 git —— 每台機器的路徑都不一樣。全部可省略,省略就用預設值。",
+
+  "_data_dir": "索引、報告、tessdata 放哪裡。省略 = 跟程式碼同一個資料夾",
+  "data_dir": "D:/文件/_findpile",
+
+  "_scan_root": "index 指令預設要掃的資料夾。省略 = 程式碼資料夾的上一層",
+  "scan_root": "D:/文件",
+
+  "_index_root": "顯示路徑時要去掉的前綴(讓結果列短一點)。省略 = 用索引裡記錄的",
+  "index_root": "D:/文件",
+
+  "_path_map": "索引裡的路徑前綴 → 這台機器的實際位置。只有把索引從別台複製過來時才需要",
+  "path_map": {},
+
+  "_path_map_範例": { "D:/文件": "/Users/me/Documents/文件" },
+
+  "_files_here": "這台有沒有原始檔。false 時「開啟檔案」會提示路徑而不是報錯,而且 index 會拒絕掃這個來源(免得把別台的紀錄誤刪)",
+  "files_here": true,
+
+  "_ocr_scopes": "給 --scope 取的名字,省得每次打長路徑。值是相對 scan_root 的目錄,可以給多個",
+  "ocr_scopes": {
+    "掃描件": ["掃描/2024", "掃描/2025"],
+    "截圖": ["手機截圖"]
+  }
+}
