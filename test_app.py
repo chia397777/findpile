@@ -22,6 +22,7 @@ widget.grab() 可以把自訂的兩行繪製、縮圖縮放逼出來真的執行
 import os
 import tempfile
 import sys
+import time
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -226,6 +227,34 @@ chk("時間篩選真的有濾掉舊的",
 w.f_time.setCurrentIndex(0)
 qapp.processEvents()
 chk("時間切回不限會還原", len(w.rows) > 0, "%d 列" % len(w.rows))
+
+print("")
+print("2d. 索引過期提示 / 更新索引按鈕")
+chk("有更新索引按鈕", hasattr(w, "btn_idx") and w.btn_idx.isVisible())
+# UI 那一半用固定數字測,才不會隨磁碟內容變來變去
+w._stale_done(12)
+qapp.processEvents()
+chk("過期時按鈕帶數字", "12" in w.btn_idx.text(), w.btn_idx.text())
+chk("過期時 stale property 打開", w.btn_idx.property("stale") is True)
+chk("過期時滑鼠提示說得清楚", "搜不到" in w.btn_idx.toolTip(),
+    w.btn_idx.toolTip()[:40])
+chk("過期時按鈕畫得出來", not w.btn_idx.grab().isNull())
+w._stale_done(0)
+qapp.processEvents()
+chk("沒過期就恢復原樣", w.btn_idx.text() == "⟳ 更新索引"
+    and not w.btn_idx.property("stale"), w.btn_idx.text())
+
+w._stale_at = 0
+w.check_stale(force=True)
+t0 = time.time()
+while w._stale_t is not None and w._stale_t.isRunning() and time.time() - t0 < 60:
+    qapp.processEvents()
+    QtCore.QThread.msleep(50)
+qapp.processEvents()
+chk("背景檢查跑得完", w._stale_t is not None and not w._stale_t.isRunning(),
+    "%.1f 秒" % (time.time() - t0))
+chk("算出來是個數字", isinstance(w._nstale, int), "%s 個待更新" % w._nstale)
+chk("檢查期間不會動到忙碌狀態", w.btn_go.isEnabled())
 
 print("")
 print("3. 強制渲染 —— TwoLine delegate 的 paint() 要真的跑過")

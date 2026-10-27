@@ -71,6 +71,7 @@ CARD = "#ffffff"
 LINE = "#e3e1db"      # 分隔線
 TEXT = "#26251f"
 MUTED = "#8a877d"
+STALE = "#b4732a"          # 索引過期時「更新索引」按鈕的顏色
 
 # 表格欄位。檔案欄永遠是最後一欄(兩行繪製的 delegate 掛在上面),
 # 日期欄在它前面。用常數而不是散落的數字 —— 插一個欄位就要全檔找
@@ -130,6 +131,15 @@ QPushButton {
 }
 QPushButton:hover   { background: #e2dfd7; }
 QPushButton:pressed { background: #d6d3ca; }
+/* 索引過期時的「更新索引」。用 property 切換,不是換物件 ——
+   換 styleSheet 字串會讓整個樣式表重算,整個視窗閃一下 */
+QPushButton[stale="true"] {
+    background: #fff2bf;
+    border-color: %(STALE)s;
+    color: %(STALE)s;
+    font-weight: bold;
+}
+QPushButton[stale="true"]:hover { background: #ffe9a8; }
 QPushButton:disabled{ color: #b5b2a9; background: #f2f1ec; }
 
 #go {
@@ -219,6 +229,7 @@ class Task(QtCore.QThread):
     done = QtCore.Signal(object)
     failed = QtCore.Signal(str)
     tick = QtCore.Signal(int, int, float, float)
+    line = QtCore.Signal(str)        # 背景工作印出來的一行進度
 
     def __init__(self, fn, parent=None):
         super().__init__(parent)
@@ -454,6 +465,9 @@ class Win(QtWidgets.QMainWindow):
         self.namerows = []       # 只靠檔名/資料夾名稱命中的結果
         self.scope = 0
         self._last = ("any", False, 0.0)
+        self._stale_at = 0.0     # 上次檢查索引是否過期的時間
+        self._stale_t = None     # 檢查用的背景執行緒(和搜尋分開放)
+        self._nstale = 0
         self.kws = []
         self.droots = [findpile.DEFAULT_ROOT]
         self.img_mode = False
@@ -502,6 +516,12 @@ class Win(QtWidgets.QMainWindow):
         self.btn_go = QtWidgets.QPushButton("搜尋", objectName="go")
         self.btn_go.clicked.connect(self.go)
         top.addWidget(self.btn_go)
+
+        self.btn_idx = QtWidgets.QPushButton("⟳ 更新索引")
+        self.btn_idx.setToolTip(
+            "重新掃描索引收錄過的資料夾,把新增和修改過的檔案收進來。\n"
+            "索引是一份快照,不會自己更新 —— 剛存的檔案要跑過這個才搜得到。")
+        self.btn_idx.clicked.connect(self.reindex)
 
         self.btn_img = QtWidgets.QPushButton("📷 以圖搜圖")
         self.btn_img.setToolTip("選一張照片,或直接把圖拖進視窗 / 按 Ctrl+V 貼上")
@@ -609,6 +629,8 @@ class Win(QtWidgets.QMainWindow):
         row2.addStretch(1)
         self.fcount = QtWidgets.QLabel("", objectName="hint")
         row2.addWidget(self.fcount)
+        row2.addSpacing(12)
+        row2.addWidget(self.btn_idx)
         v.addLayout(row2)
         return box
 
@@ -811,6 +833,7 @@ class Win(QtWidgets.QMainWindow):
                            format(nameonly, ","), src,
                            "" if here else "　·　部分原始檔不在本機"))
         self.kw.setFocus()
+        self.check_stale(force=True)
 
     def set_status(self, s):
         self.status.setText(s)
@@ -818,8 +841,150 @@ class Win(QtWidgets.QMainWindow):
     def busy(self, on):
         self.btn_go.setEnabled(not on)
         self.btn_img.setEnabled(not on)
+        self.btn_idx.setEnabled(not on)
         if not on:
             self.prog.setVisible(False)
+
+    def check_stale(self, force=False):
+        """
+        背景比對磁碟和索引,算出有幾個檔案沒收進來。
+
+        不用 _run():那條路會在結束時呼叫 busy(False),把搜尋按鈕打開 ——
+        如果使用者正在搜尋,按鈕就會在搜尋還沒回來之前先亮起來。
+        這個檢查是背景雜務,不該碰介面的忙碌狀態。
+
+        60 秒內不重複查。視窗切來切去會發很多次 WindowActivate,
+        每次都掃一遍磁碟並不划算。
+        """
+        if self._stale_t is not None and self._stale_t.isRunning():
+            return
+        if not force and time.time() - self._stale_at < 60:
+            return
+        self._stale_at = time.time()
+
+        def work(_t):
+            con = findpile.db_open()
+            roots = [r for r in findpile.roots_get(con) if os.path.isdir(r)]
+            known = {r[0]: (r[1], r[2]) for r in
+                     con.execute("SELECT path, mtime, size FROM docs")}
+            con.close()
+            n = 0
+            for root in roots:
+                for p, mt, sz in findpile.walk(root):
+                    o = known.get(p)
+                    if o is None or abs(o[0] - mt) > 1 or o[1] != sz:
+                        n += 1
+            return n
+
+        t = Task(work, self)
+        t.done.connect(self._stale_done)
+        t.failed.connect(lambda _m: None)      # 查不到就算了,不要跳錯誤給人看
+        self._stale_t = t
+        t.start()
+
+    def _stale_done(self, n):
+        self._nstale = n
+        self.btn_idx.setText("⟳ 更新索引 (%s)" % format(n, ",") if n
+                             else "⟳ 更新索引")
+        self.btn_idx.setProperty("stale", bool(n))
+        # setProperty 不會自己重繪,要踢一下樣式表
+        self.btn_idx.style().unpolish(self.btn_idx)
+        self.btn_idx.style().polish(self.btn_idx)
+        self.btn_idx.setToolTip(
+            "有 %s 個檔案新增或修改過,還沒收進索引 —— 現在搜不到它們。\n"
+            "按一下重新掃描。" % format(n, ",") if n else
+            "重新掃描索引收錄過的資料夾。索引是一份快照,不會自己更新。")
+
+    def event(self, e):
+        # 視窗重新取得焦點時查一次:存完檔切回來,馬上就知道要不要更新。
+        # 今天的實際情形是「存了檔、搜不到、以為程式壞了」,就是少了這一下。
+        if e.type() == QtCore.QEvent.WindowActivate:
+            self.check_stale()
+        return super().event(e)
+
+    def reindex(self):
+        """
+        背景重掃索引。
+
+        掃哪些資料夾?用索引裡記錄的 roots,不是設定檔的 scan_root ——
+        「更新」的語意是「把已經收錄的範圍再看一次」。這台的索引可能是用
+        --root 指到別處建的,拿 scan_root 去掃會掃到不相干的地方,而且
+        原本收錄的那些會因為這次沒掃到而被動到。
+
+        cmd_index 是印到 stdout 的命令列函式。與其為了介面改寫它,
+        不如把 stdout 接走 —— 它印的每一行本來就是給人看的進度,
+        直接送到狀態列剛好。
+        """
+        import argparse
+        import io as _io
+
+        con = findpile.db_open()
+        roots = [r for r in findpile.roots_get(con) if os.path.isdir(r)]
+        con.close()
+        if not roots:
+            roots = [findpile.DEFAULT_ROOT]
+
+        names = "、".join(findpile.split_display(r.rstrip("/" + os.sep))[1] or r
+                          for r in roots)
+        if self._nstale == 0 and QtWidgets.QMessageBox.question(
+                self, "更新索引",
+                "剛才檢查過,沒有新增或修改過的檔案。\n還是要重新掃描一次嗎?",
+                QtWidgets.QMessageBox.Ok | QtWidgets.QMessageBox.Cancel
+        ) != QtWidgets.QMessageBox.Ok:
+            return
+        if self._nstale and QtWidgets.QMessageBox.question(
+                self, "更新索引",
+                "有 %s 個檔案新增或修改過,要收進索引嗎?\n\n%s\n\n"
+                "期間視窗可以繼續用。"
+                % (format(self._nstale, ","), "\n".join(roots)),
+                QtWidgets.QMessageBox.Ok | QtWidgets.QMessageBox.Cancel
+        ) != QtWidgets.QMessageBox.Ok:
+            return
+
+        self.busy(True)
+        self.prog.setVisible(True)
+        self.prog.setRange(0, 0)             # 總量未知,先跑馬燈
+        self.set_status("更新索引中:%s" % names)
+
+        class _Pipe(_io.TextIOBase):
+            """把 cmd_index 印出來的每一行轉成 signal。"""
+
+            def __init__(self, t):
+                self.t = t
+                self.buf = ""
+
+            def write(self, x):
+                self.buf += x
+                while "\n" in self.buf:
+                    line, self.buf = self.buf.split("\n", 1)
+                    if line.strip():
+                        self.t.line.emit(line.strip())
+                return len(x)
+
+        def work(t):
+            a = argparse.Namespace(root=findpile.DEFAULT_ROOT, dir=roots, mac=False,
+                                   force=False, full=False, all=False,
+                                   scope=None, quiet=False, workers=4)
+            old = sys.stdout
+            sys.stdout = _Pipe(t)
+            try:
+                findpile.cmd_index(a)
+            finally:
+                sys.stdout = old
+            return True
+
+        t = self._run(work, self._reindexed)
+        t.line.connect(lambda s: self.set_status("更新索引:%s" % s))
+
+    def _reindexed(self, _ok):
+        self.prog.setVisible(False)
+        self.load_db()                       # 狀態列的筆數要跟著變
+        self.check_stale(force=True)         # 數字要歸零,不然按鈕一直掛著
+        if self.kws and not self.img_mode:
+            # 剛收進來的檔案要立刻找得到,不然使用者會以為沒更新到
+            self.go()
+        else:
+            self.set_status(self.status.text() + "　·　索引已更新")
 
     # ------------------------------------------------------- 關鍵字搜尋
 
