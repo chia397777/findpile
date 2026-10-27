@@ -1058,7 +1058,15 @@ def is_borrowed_root(root):
             or _under(root, ir) or _under(ir, root))
 
 
-def cmd_index(args):
+def cmd_index(args, say=None):
+    """
+    建立 / 更新索引。
+
+    say 是輸出去向,預設印到終端機。視窗版傳一個 callable 進來,把每一行
+    進度轉成 signal 送到狀態列 —— **不要改 sys.stdout**:那是全域的,
+    在背景執行緒換掉它,主執行緒同一時間印的東西也會一起被吃掉。
+    """
+    say = say or print
     roots = guard_roots(index_targets(args))
     if not roots:
         return
@@ -1076,11 +1084,11 @@ def cmd_index(args):
         for root in roots:
             if is_borrowed_root(root):
                 n = sum(1 for p in known if _under(p, root))
-                print("略過 %s" % root)
-                print("  config.json 標示原始檔不在這台(files_here=false)。")
-                print("  在這裡掃會掃不到東西,然後把索引裡的 %s 筆當成已刪除清掉。"
+                say("略過 %s" % root)
+                say("  config.json 標示原始檔不在這台(files_here=false)。")
+                say("  在這裡掃會掃不到東西,然後把索引裡的 %s 筆當成已刪除清掉。"
                       % format(n, ","))
-                print("  這份索引直接用 find 查就好。真要重建請加 --force。")
+                say("  這份索引直接用 find 查就好。真要重建請加 --force。")
             else:
                 keep.append(root)
         roots = keep
@@ -1092,14 +1100,14 @@ def cmd_index(args):
         con.commit()
         for p in victims:
             known.pop(p, None)
-        print("已清空 %s 筆舊紀錄,這些資料夾全部重建。" % format(len(victims), ","))
+        say("已清空 %s 筆舊紀錄,這些資料夾全部重建。" % format(len(victims), ","))
 
     found, todo, names, gone = set(), [], [], []
     for root in roots:
         if not os.path.isdir(root):
-            print("找不到資料夾,略過:%s" % root)
+            say("找不到資料夾,略過:%s" % root)
             continue
-        print("掃描:%s" % root)
+        say("掃描:%s" % root)
         here, errs, cloud = set(), [], set()
         for p, mt, sz in walk(root, errs, cloud):
             here.add(p)
@@ -1116,16 +1124,16 @@ def cmd_index(args):
                 names.append((p, mt, sz, ext, 0, "", None, "name"))
 
         if cloud:
-            print("  %s 個檔案只存在 iCloud,本機沒有下載,這次抽不到內文。"
+            say("  %s 個檔案只存在 iCloud,本機沒有下載,這次抽不到內文。"
                   % format(len(cloud), ","))
-            print("  (要收錄的話:關掉 系統設定 > Apple ID > iCloud >"
+            say("  (要收錄的話:關掉 系統設定 > Apple ID > iCloud >"
                   " 最佳化 Mac 儲存空間,等檔案下載完再掃一次)")
 
         if errs:
             # 讀取出錯時 here 一定不完整,這時絕對不能做「已刪除」判定。
-            print("  !! 有 %d 個目錄讀不到(第一個:%s)" % (len(errs), errs[0]))
-            print("  !! 這次跳過「已刪除」判定,以免把查得到的資料誤刪。")
-            print("  !! macOS 請到 系統設定 > 隱私權與安全性 > 檔案與資料夾,"
+            say("  !! 有 %d 個目錄讀不到(第一個:%s)" % (len(errs), errs[0]))
+            say("  !! 這次跳過「已刪除」判定,以免把查得到的資料誤刪。")
+            say("  !! macOS 請到 系統設定 > 隱私權與安全性 > 檔案與資料夾,"
                   "把「文件」「桌面」「下載」授權給終端機。")
         else:
             # 「消失的檔案」只在這個根目錄的範圍內判斷。不限定範圍的話,
@@ -1162,10 +1170,10 @@ def cmd_index(args):
         con.executemany(DOCS_INSERT, names)
         con.commit()
 
-    print("掃到 %d 個檔案,其中 %d 個需要抽內文,%d 個只記名稱,%d 個已移除。"
+    say("掃到 %d 個檔案,其中 %d 個需要抽內文,%d 個只記名稱,%d 個已移除。"
           % (len(found), len(todo), len(names), len(gone)))
     if not todo:
-        print("索引已是最新。")
+        say("索引已是最新。")
         return
 
     t0 = time.time()
@@ -1178,8 +1186,8 @@ def cmd_index(args):
         done[0] += 1
         if done[0] % 200 == 0:
             el = time.time() - t0
-            print("  %d/%d  (%.0f 檔/秒)" % (done[0], len(todo), done[0] / max(el, .01)),
-                  flush=True)
+            say("  %d/%d  (%.0f 檔/秒)" % (done[0], len(todo), done[0] / max(el, .01)),
+                  )
         return (p, mt, sz, os.path.splitext(p)[1].lower(), len(text), err, text, "extract")
 
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
@@ -1199,7 +1207,7 @@ def cmd_index(args):
                         " WHERE err='' AND nchars=0 AND src<>'name'").fetchone()[0]
     con.execute("PRAGMA wal_checkpoint(TRUNCATE)")   # 先落盤再量大小
     mb = os.path.getsize(DB_PATH) / 1024 / 1024
-    print("完成,耗時 %.1f 秒。索引檔 %.1f MB。抽取失敗 %d 個、抽到空白 %d 個"
+    say("完成,耗時 %.1f 秒。索引檔 %.1f MB。抽取失敗 %d 個、抽到空白 %d 個"
           "(多為掃描影像 PDF,需 OCR;用 stats 看明細)。"
           % (time.time() - t0, mb, bad, empty))
 

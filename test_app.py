@@ -231,7 +231,10 @@ chk("時間切回不限會還原", len(w.rows) > 0, "%d 列" % len(w.rows))
 print("")
 print("2d. 索引過期提示 / 更新索引按鈕")
 chk("有更新索引按鈕", hasattr(w, "btn_idx") and w.btn_idx.isVisible())
-# UI 那一半用固定數字測,才不會隨磁碟內容變來變去
+# UI 那一半用固定數字測,才不會隨磁碟內容變來變去。
+# _auto_done 先關掉 —— 不然 _stale_done(12) 會觸發真的自動更新,
+# 在測試中途跑一次完整索引(而且會把下面的輸出攪亂)。
+w._auto_done = True
 w._stale_done(12)
 qapp.processEvents()
 chk("過期時按鈕帶數字", "12" in w.btn_idx.text(), w.btn_idx.text())
@@ -255,6 +258,37 @@ chk("背景檢查跑得完", w._stale_t is not None and not w._stale_t.isRunning
     "%.1f 秒" % (time.time() - t0))
 chk("算出來是個數字", isinstance(w._nstale, int), "%s 個待更新" % w._nstale)
 chk("檢查期間不會動到忙碌狀態", w.btn_go.isEnabled())
+
+print("")
+print("2e. 開窗自動更新索引")
+_calls = []
+_real_reindex = w.reindex
+w.reindex = lambda auto=False: _calls.append(auto)
+
+w._auto_done = False
+w._stale_done(5)
+chk("有待更新就自動跑,而且是 auto", _calls == [True], _calls)
+
+_calls.clear()
+w._stale_done(3)
+chk("同一次開窗只自動跑一次", _calls == [], _calls)
+
+_calls.clear()
+w._auto_done = False
+w._stale_done(0)
+chk("沒東西要更新就完全不跑", _calls == [] and w._auto_done is False, _calls)
+
+_calls.clear()
+findpile.CONFIG["auto_index"] = False
+w._auto_done = False
+w._stale_done(5)
+chk("config 關掉 auto_index 就不自動跑", _calls == [], _calls)
+findpile.CONFIG.pop("auto_index")
+
+w.reindex = _real_reindex
+w._auto_done = True
+w._stale_done(0)
+chk("按鈕最後回到乾淨狀態", w.btn_idx.text() == "⟳ 更新索引")
 
 print("")
 print("3. 強制渲染 —— TwoLine delegate 的 paint() 要真的跑過")

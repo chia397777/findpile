@@ -465,8 +465,10 @@ class Win(QtWidgets.QMainWindow):
         self.namerows = []       # 只靠檔名/資料夾名稱命中的結果
         self.scope = 0
         self._last = ("any", False, 0.0)
+        self._auto_done = False  # 這次開窗的自動更新跑過了沒
         self._stale_at = 0.0     # 上次檢查索引是否過期的時間
         self._stale_t = None     # 檢查用的背景執行緒(和搜尋分開放)
+        self._idx_t = None       # 更新索引用的背景執行緒
         self._nstale = 0
         self.kws = []
         self.droots = [findpile.DEFAULT_ROOT]
@@ -884,6 +886,18 @@ class Win(QtWidgets.QMainWindow):
 
     def _stale_done(self, n):
         self._nstale = n
+        # 開窗後第一次檢查完,有東西要更新就自己跑,不用人按。
+        #
+        # 只在「開窗後第一次」跑。視窗每次重新取得焦點都會再查一次,
+        # 那是為了把按鈕點亮;如果每次回到視窗都自動寫入,使用者會在
+        # 完全沒預期的時候看到進度跑來跑去,而且是在他正要搜尋的那一刻。
+        #
+        # 沒變動就完全不跑 —— 開窗的成本就只有那 1.7 秒的背景比對,
+        # 零寫入。
+        if (n and not self._auto_done
+                and findpile.CONFIG.get("auto_index", True) is not False):
+            self._auto_done = True
+            self.reindex(auto=True)
         self.btn_idx.setText("⟳ 更新索引 (%s)" % format(n, ",") if n
                              else "⟳ 更新索引")
         self.btn_idx.setProperty("stale", bool(n))
@@ -902,9 +916,9 @@ class Win(QtWidgets.QMainWindow):
             self.check_stale()
         return super().event(e)
 
-    def reindex(self):
+    def reindex(self, auto=False):
         """
-        背景重掃索引。
+        背景重掃索引。auto=True 是開窗時自動跑的那一次,不問人。
 
         掃哪些資料夾?用索引裡記錄的 roots,不是設定檔的 scan_root ——
         「更新」的語意是「把已經收錄的範圍再看一次」。這台的索引可能是用
@@ -916,7 +930,6 @@ class Win(QtWidgets.QMainWindow):
         直接送到狀態列剛好。
         """
         import argparse
-        import io as _io
 
         con = findpile.db_open()
         roots = [r for r in findpile.roots_get(con) if os.path.isdir(r)]
@@ -926,13 +939,15 @@ class Win(QtWidgets.QMainWindow):
 
         names = "、".join(findpile.split_display(r.rstrip("/" + os.sep))[1] or r
                           for r in roots)
-        if self._nstale == 0 and QtWidgets.QMessageBox.question(
+        if auto and not roots:
+            return                           # 根目錄都掛不上,這次什麼都別做
+        if not auto and self._nstale == 0 and QtWidgets.QMessageBox.question(
                 self, "更新索引",
                 "剛才檢查過,沒有新增或修改過的檔案。\n還是要重新掃描一次嗎?",
                 QtWidgets.QMessageBox.Ok | QtWidgets.QMessageBox.Cancel
         ) != QtWidgets.QMessageBox.Ok:
             return
-        if self._nstale and QtWidgets.QMessageBox.question(
+        if not auto and self._nstale and QtWidgets.QMessageBox.question(
                 self, "更新索引",
                 "有 %s 個檔案新增或修改過,要收進索引嗎?\n\n%s\n\n"
                 "期間視窗可以繼續用。"
@@ -941,50 +956,51 @@ class Win(QtWidgets.QMainWindow):
         ) != QtWidgets.QMessageBox.Ok:
             return
 
-        self.busy(True)
+        # 自動跑的時候不要鎖住搜尋按鈕 —— 使用者開窗就是要查東西,
+        # 不該為了背景雜務等它。手動按的那次才鎖,因為那是他主動要的動作。
+        if not auto:
+            self.busy(True)
         self.prog.setVisible(True)
         self.prog.setRange(0, 0)             # 總量未知,先跑馬燈
-        self.set_status("更新索引中:%s" % names)
-
-        class _Pipe(_io.TextIOBase):
-            """把 cmd_index 印出來的每一行轉成 signal。"""
-
-            def __init__(self, t):
-                self.t = t
-                self.buf = ""
-
-            def write(self, x):
-                self.buf += x
-                while "\n" in self.buf:
-                    line, self.buf = self.buf.split("\n", 1)
-                    if line.strip():
-                        self.t.line.emit(line.strip())
-                return len(x)
+        self.set_status("%s更新索引中:%s"
+                        % ("自動" if auto else "", names))
 
         def work(t):
             a = argparse.Namespace(root=findpile.DEFAULT_ROOT, dir=roots, mac=False,
                                    force=False, full=False, all=False,
                                    scope=None, quiet=False, workers=4)
-            old = sys.stdout
-            sys.stdout = _Pipe(t)
-            try:
-                findpile.cmd_index(a)
-            finally:
-                sys.stdout = old
+            # 把每一行進度直接轉成 signal。
+            # 以前是在這裡把 sys.stdout 換掉 —— 那是全域的,背景執行緒換掉
+            # 它,主執行緒同一時間印的東西也會一起被吃掉。測試就是這樣少了
+            # 好幾節輸出;GUI 上看不出來,因為沒有人在看終端機。
+            findpile.cmd_index(a, say=lambda *xs: t.line.emit(
+                " ".join(str(x) for x in xs).strip()))
             return True
 
-        t = self._run(work, self._reindexed)
-        t.line.connect(lambda s: self.set_status("更新索引:%s" % s))
+        t = Task(work, self)
+        t.done.connect(lambda _x, a=auto: self._reindexed(a))
+        t.failed.connect(self._reindex_failed)
+        if not auto:
+            t.finished.connect(lambda: self.busy(False))
+        t.line.connect(lambda s: s and self.set_status("更新索引:%s" % s))
+        self._idx_t = t                      # 和搜尋的 _task 分開放
+        t.start()
 
-    def _reindexed(self, _ok):
+    def _reindex_failed(self, msg):
+        # 自動更新失敗不要彈視窗擋在使用者面前 —— 他只是想開程式查東西
+        self.prog.setVisible(False)
+        self.set_status("索引更新失敗:%s" % msg)
+
+    def _reindexed(self, auto=False):
         self.prog.setVisible(False)
         self.load_db()                       # 狀態列的筆數要跟著變
+        self._stale_at = 0
         self.check_stale(force=True)         # 數字要歸零,不然按鈕一直掛著
         if self.kws and not self.img_mode:
-            # 剛收進來的檔案要立刻找得到,不然使用者會以為沒更新到
+            # 剛收進來的檔案要立刻找得到,不然使用者會以為沒更新到。
+            # 自動那次也要重跑:開窗後一邊更新一邊搜尋是很自然的動作,
+            # 更新完卻還是舊結果的話,看起來就像更新沒生效。
             self.go()
-        else:
-            self.set_status(self.status.text() + "　·　索引已更新")
 
     # ------------------------------------------------------- 關鍵字搜尋
 

@@ -27,6 +27,9 @@
   "_skip_dirs": "再多排除幾個資料夾名稱。預設已含 node_modules、build、Pods、DerivedData,以及所有 . 開頭的資料夾",
   "skip_dirs": [],
 
+  "_auto_index": "開窗時若偵測到有檔案還沒收進索引,就自動更新一次。預設 true;設 false 就只在按鈕上提示,等你自己按",
+  "auto_index": true,
+
   "_keep_dirs": "把預設排除的某一個放行。例如你真的有一個叫 build 的資料夾要收:[\"build\"]",
   "keep_dirs": []
 }
