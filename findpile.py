@@ -1540,6 +1540,144 @@ def cmd_merge(args):
 
 # ---------------------------------------------------------------- 狀態
 
+def _dup_groups(con):
+    """
+    用 pHash 把完全相同的圖片分組。
+
+    距離 0 就是雜湊完全相同,所以不必兩兩比對(那是 N 平方次),
+    直接拿 phash 當 dict 的鍵分組,一萬多張幾秒就跑完。
+
+    這裡只收「距離 0」。pHash 距離 1~5 是「看起來很像」,那是 findimg
+    在做的事 —— 拿來當刪檔依據太危險,連拍的兩張、同一張圖的不同裁切
+    都可能落在那個範圍。
+    """
+    groups = {}
+    for path, ph, size, w, h in con.execute(
+            "SELECT path, phash, size, w, h FROM imgs WHERE phash IS NOT NULL"):
+        groups.setdefault(ph, []).append((path, size or 0, w or 0, h or 0))
+    return {k: v for k, v in groups.items() if len(v) > 1}
+
+
+def _dup_pick(items):
+    """
+    一組重複裡要留哪一張。
+
+    先比畫素(同一張圖可能有不同解析度的版本),再比檔案大小(同尺寸時
+    壓得少的那張畫質較好),最後比路徑長度 —— 路徑短的通常是原始位置,
+    深的那個多半是備份或匯出。
+
+    回傳 (要留的, [其餘的])。
+    """
+    ranked = sorted(items, key=lambda t: (-(t[2] * t[3]), -t[1], len(t[0])))
+    return ranked[0], ranked[1:]
+
+
+def cmd_dupimg(args):
+    import imgfind            # 只有以圖搜圖這幾個指令需要 opencv,延後匯入
+    fcon = imgfind.feat_open(DATA_DIR)
+    try:
+        # feat_open 找不到檔案會自己建一個空的,所以不能靠例外判斷
+        # 「沒特徵庫」。不先數一次的話,沒建特徵庫會印出「沒有找到完全
+        # 重複的圖片」—— 那句話是錯的,而且會讓人以為已經查過了。
+        n = fcon.execute("SELECT COUNT(*) FROM imgs").fetchone()[0]
+        dups = _dup_groups(fcon) if n else {}
+    finally:
+        fcon.close()
+
+    if not n:
+        print("還沒有圖片特徵庫,沒有東西可以比對。先跑:")
+        print("    python %s imgindex" % os.path.basename(__file__))
+        return
+    if not dups:
+        print("比對了 %s 張圖片,沒有找到完全重複的。" % format(n, ","))
+        return
+    print("比對 %s 張圖片。" % format(n, ","))
+
+    rows = []
+    waste = 0
+    for items in dups.values():
+        keep, extra = _dup_pick(items)
+        waste += sum(t[1] for t in extra)
+        rows.append((keep, extra))
+    # 省最多空間的排前面 —— 要動手整理的話從這些開始最划算
+    rows.sort(key=lambda kv: -sum(t[1] for t in kv[1]))
+
+    n_extra = sum(len(e) for _k, e in rows)
+    print("重複組數  %s 組" % format(len(rows), ","))
+    print("多餘副本  %s 張" % format(n_extra, ","))
+    print("佔用空間  %s" % fmt_size(waste))
+    print("")
+
+    droots = display_roots(db_open())
+    lines = ["# 重複圖片清單 —— %s" % time.strftime("%Y-%m-%d %H:%M"), "",
+             "pHash 完全相同(距離 0)才算重複:縮放、重新壓縮、改檔名都認得出來,",
+             "但不會把「很像」的兩張當成同一張。", "",
+             "| | |", "|---|---|",
+             "| 比對張數 | %s 張 |" % format(n, ","),
+             "| 重複組數 | %s 組 |" % format(len(rows), ","),
+             "| 多餘副本 | %s 張 |" % format(n_extra, ","),
+             "| 佔用空間 | %s |" % fmt_size(waste), "",
+             "---", "",
+             "## 這份清單不會幫你刪任何東西", "",
+             "每一組列出「建議保留」和「其餘副本」。保留的挑法:先比畫素,",
+             "再比檔案大小,最後比路徑長度(短的通常是原始位置)。",
+             "**這只是建議 —— 刪之前請自己看過。**", ""]
+
+    # 哪些「資料夾對」重複得最嚴重。整批處理的單位是資料夾,不是單張圖
+    pairs = {}
+    for keep, extra in rows:
+        ds = sorted({os.path.dirname(t[0]) for t in [keep] + extra})
+        for i in range(len(ds)):
+            for j in range(i + 1, len(ds)):
+                pairs[(ds[i], ds[j])] = pairs.get((ds[i], ds[j]), 0) + 1
+    if pairs:
+        lines += ["## 重複最集中的資料夾配對", "",
+                  "整批整理的單位是資料夾,不是單張圖。這幾對先看。", "",
+                  "| 重複張數 | A | B |", "|---|---|---|"]
+        top = sorted(pairs.items(), key=lambda kv: -kv[1])[:15]
+        for (a, b), c in top:
+            lines.append("| %d | `%s` | `%s` |"
+                         % (c, strip_root_any(a, droots), strip_root_any(b, droots)))
+        lines.append("")
+        print("重複最集中的資料夾配對:")
+        for (a, b), c in top[:5]:
+            print("  %4d 張   %s" % (c, strip_root_any(a, droots)))
+            print("            %s" % strip_root_any(b, droots))
+        print("")
+
+    lines += ["---", "", "## 逐組明細", ""]
+    for i, (keep, extra) in enumerate(rows[:args.top], 1):
+        lines.append("### %d. %dx%d　省 %s"
+                     % (i, keep[2], keep[3], fmt_size(sum(t[1] for t in extra))))
+        lines.append("")
+        # 每一行都把尺寸寫出來。同一張圖可能有不同解析度的版本,
+        # 少了這個數字就無從判斷「刪掉的是不是比較好的那張」。
+        lines.append("- **留** `%s`　%dx%d　%s"
+                     % (strip_root_any(keep[0], droots), keep[2], keep[3],
+                        fmt_size(keep[1])))
+        for t in extra:
+            lines.append("- 　重複 `%s`　%dx%d　%s"
+                         % (strip_root_any(t[0], droots), t[2], t[3],
+                            fmt_size(t[1])))
+        lines.append("")
+    if len(rows) > args.top:
+        lines.append("(只列前 %d 組,還有 %d 組。用 --top 調整)"
+                     % (args.top, len(rows) - args.top))
+
+    os.makedirs(REPORT_DIR, exist_ok=True)
+    out = args.out or os.path.join(
+        REPORT_DIR, "重複圖片_%s.md" % time.strftime("%Y%m%d_%H%M"))
+    io.open(out, "w", encoding="utf-8").write("\n".join(lines))
+    print("清單已存:%s" % out)
+    print("")
+    print("這個指令不會刪任何檔案。要動手的話,先打開上面那份清單看過。")
+    if args.open:
+        try:
+            open_path(out)
+        except Exception as e:                      # noqa: BLE001
+            print("(無法自動開啟:%s)" % e)
+
+
 def cmd_stats(args):
     con = db_open()
     n, chars = con.execute("SELECT COUNT(*), COALESCE(SUM(nchars),0) FROM docs").fetchone()
@@ -1771,6 +1909,12 @@ def main():
                           "兩種設定都會掃完整個索引")
     pfi.add_argument("--top", type=int, default=40, help="列出前幾名(預設 40)")
     pfi.set_defaults(func=cmd_findimg)
+
+    pd = sub.add_parser("dupimg", help="找出完全重複的圖片(只列清單,不會刪)")
+    pd.add_argument("--top", type=int, default=200, help="明細列幾組(預設 200)")
+    pd.add_argument("--out", help="清單存到哪裡")
+    pd.add_argument("--open", action="store_true", help="存完直接開啟")
+    pd.set_defaults(func=cmd_dupimg)
 
     ps = sub.add_parser("stats", help="索引狀態")
     ps.set_defaults(func=cmd_stats)
