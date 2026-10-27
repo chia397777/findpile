@@ -891,9 +891,9 @@ def roots_get(con):
 def roots_add(con, root):
     import json
     rs = roots_get(con)
-    # 新的根目錄若涵蓋了舊的(例如先只掃 ~/Word,後來改掃整個家目錄),
+    # 新的根目錄若涵蓋了舊的(例如先只掃 ~/Documents,後來改掃整個家目錄),
     # 把被涵蓋的那幾筆收起來,否則來源清單會愈積愈多,
-    # 視窗狀態列會變成「來源 6 處:Word、lexipass、Documents…」。
+    # 視窗狀態列會變成「來源 6 處:Documents、Desktop、Downloads…」。
     rs = [r for r in rs if not _under(r, root)]
     if not any(_sep_norm(r) == _sep_norm(root) for r in rs)        and not any(_under(root, r) for r in rs):   # 已被更大的根目錄涵蓋就不必登錄
         rs.append(root)
