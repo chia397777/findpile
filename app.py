@@ -877,15 +877,22 @@ class Win(QtWidgets.QMainWindow):
         def work(_t):
             con = findpile.db_open()
             roots = [r for r in findpile.roots_get(con) if os.path.isdir(r)]
-            known = {r[0]: (r[1], r[2]) for r in
-                     con.execute("SELECT path, mtime, size FROM docs")}
+            known = {r[0]: (r[1], r[2], r[3]) for r in
+                     con.execute("SELECT path, mtime, size, src FROM docs")}
             con.close()
             n = 0
             for root in roots:
                 for p, mt, sz in findpile.walk(root):
                     o = known.get(p)
-                    if o is None or abs(o[0] - mt) > 1 or o[1] != sz:
-                        n += 1
+                    if o is not None and abs(o[0] - mt) <= 1 and o[1] == sz:
+                        continue
+                    # 和 cmd_index 用同一條規則。OCR 紀錄就算檔案變了
+                    # index 也刻意保留不重抽,這裡要是照數,數字永遠歸不了零
+                    # —— 按鈕一直亮著,而且每次開窗都自動跑一次完整更新,
+                    # 跑完數字一樣。兩邊的「有幾個待更新」必須是同一個定義。
+                    if findpile.is_ocr(o[2] if o else None):
+                        continue
+                    n += 1
             return n
 
         t = Task(work, self)
