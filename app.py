@@ -437,6 +437,10 @@ class Win(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.rows = []
+        self.docrows = []        # 有內文的結果
+        self.namerows = []       # 只靠檔名/資料夾名稱命中的結果
+        self.scope = 0
+        self._last = ("any", False, 0.0)
         self.kws = []
         self.droots = [findpile.DEFAULT_ROOT]
         self.img_mode = False
@@ -528,6 +532,23 @@ class Win(QtWidgets.QMainWindow):
         self.v_list.clicked.connect(lambda: self.set_view(0))
         self.v_grid.clicked.connect(lambda: self.set_view(1))
         self.v_grid.setEnabled(False)
+        row.addSpacing(18)
+
+        # 「有內文」和「只有名稱」分兩區,不混排。影片、音檔、還沒 OCR 的
+        # 圖片抽不出內文,分數只能靠檔名湊,跟文件擺在一起排名會互相干擾
+        # —— 查一個相簿資料夾名會一次噴出幾千張照片,把文件壓到看不見。
+        self.sc_doc = QtWidgets.QPushButton("📄 有內文", objectName="seg",
+                                            checkable=True, checked=True)
+        self.sc_name = QtWidgets.QPushButton("🏷 只有名稱", objectName="seg",
+                                             checkable=True)
+        sg = QtWidgets.QButtonGroup(self)
+        sg.setExclusive(True)
+        for b in (self.sc_doc, self.sc_name):
+            sg.addButton(b)
+            row.addWidget(b)
+        self.sc_doc.clicked.connect(lambda: self.set_scope(0))
+        self.sc_name.clicked.connect(lambda: self.set_scope(1))
+        self.sc_name.setEnabled(False)
 
         row.addStretch(1)
         self.hint = QtWidgets.QLabel("掃描檔用短關鍵字(2 字)比較找得到",
@@ -710,6 +731,8 @@ class Win(QtWidgets.QMainWindow):
                 "SELECT COUNT(*), COALESCE(SUM(nchars),0) FROM docs").fetchone()
             ocr = con.execute(
                 "SELECT COUNT(*) FROM docs WHERE src LIKE 'ocr%'").fetchone()[0]
+            nameonly = con.execute(
+                "SELECT COUNT(*) FROM docs WHERE src='name'").fetchone()[0]
             self.droots = findpile.display_roots(con)
             con.close()
         except Exception as e:                      # noqa: BLE001
@@ -724,8 +747,10 @@ class Win(QtWidgets.QMainWindow):
                 "、".join(findpile.split_display(r.rstrip("\\/"))[1] or r
                           for r in self.droots))
         here = findpile.CONFIG.get("files_here", True)
-        self.set_status("索引:%s 個檔案、%.0f 萬字(其中 %s 個是 OCR 辨識)%s%s"
-                        % (format(n, ","), ch / 10000, format(ocr, ","), src,
+        self.set_status("索引:%s 個檔案、%.0f 萬字(OCR 辨識 %s 個"
+                        "、只有名稱 %s 個)%s%s"
+                        % (format(n, ","), ch / 10000, format(ocr, ","),
+                           format(nameonly, ","), src,
                            "" if here else "　·　部分原始檔不在本機"))
         self.kw.setFocus()
 
@@ -784,20 +809,45 @@ class Win(QtWidgets.QMainWindow):
             return                           # 已經有更新的搜尋了
         self.img_mode = False
         self.kws = kws
-        self.rows = rows[:300]
-        self._headers(["#", "分數", "命中", "字數", "檔案"])
+        self.docrows = [r for r in rows if not r["nameonly"]]
+        self.namerows = sorted((r for r in rows if r["nameonly"]),
+                               key=lambda r: r["path"])
+        self._last = (mode, loose, el)
+        self.sc_name.setEnabled(bool(self.namerows))
+        self.sc_name.setText("🏷 只有名稱 %s" % format(len(self.namerows), ",")
+                             if self.namerows else "🏷 只有名稱")
+        self.sc_name.setToolTip(
+            "影片、音檔、還沒 OCR 的圖片:只能用檔名和資料夾名稱找"
+            if self.namerows else "這次沒有只靠名稱命中的檔案")
+        # 文件沒命中、名稱有命中,就直接切到名稱區 —— 不然畫面是空的,
+        # 看起來像「查不到」,其實旁邊按鈕裡有幾百筆。
+        self.set_scope(1 if not self.docrows and self.namerows else 0)
+
+    def set_scope(self, which):
+        """0 = 有內文的文件,1 = 只有名稱的檔案(影片、音檔、未 OCR 的圖)。"""
+        if which == 1 and not self.sc_name.isEnabled():
+            which = 0
+        (self.sc_doc if which == 0 else self.sc_name).setChecked(True)
+        self.scope = which
+        src = self.namerows if which else self.docrows
+        self.rows = src[:300]
+        self._headers(["#", "分數", "命中", "字數", "檔案"] if which == 0
+                      else ["#", "類型", "命中位置", "大小", "檔案"])
         self._fill_table()
         nimg = sum(1 for r in self.rows if is_img(r["path"]))
         self.v_grid.setEnabled(nimg > 0)
         self.v_grid.setToolTip("結果裡有 %d 個圖片檔" % nimg if nimg
                                else "這批結果沒有圖片檔")
+        mode, loose, el = self._last
+        kind = "只有名稱" if which else "有內文"
         self.set_status(
-            "「%s」(%s%s)　命中 %s 個檔案,顯示前 %d 名　耗時 %.2f 秒%s"
-            % ("、".join(kws), "全部出現" if mode == "all" else "任一出現",
-               "+模糊" if loose else "", format(len(rows), ","),
-               len(self.rows), el,
+            "「%s」(%s%s)　有內文 %s 個、只有名稱 %s 個　現在看「%s」前 %d 名"
+            "　耗時 %.2f 秒%s"
+            % ("、".join(self.kws), "全部出現" if mode == "all" else "任一出現",
+               "+模糊" if loose else "", format(len(self.docrows), ","),
+               format(len(self.namerows), ","), kind, len(self.rows), el,
                "　·　其中 %d 個是圖片,可切「▦ 縮圖」" % nimg if nimg else ""))
-        self.set_view(0)
+        self.set_view(1 if which == 1 and nimg == len(self.rows) and nimg else 0)
         self.select_first()
 
     def _fill_table(self):
@@ -819,6 +869,14 @@ class Win(QtWidgets.QMainWindow):
                         "%dx%d" % (r["w"], r["h"]))
                 badge = (("✓ 相符", "#dcefe3", OK) if r["sure"]
                          else ("? 要看一眼", "#f6ecd5", OCRCLR))
+            elif r.get("nameonly"):
+                # 這一區沒有內文,「命中次數」和「字數」都沒有意義。
+                # 改成顯示檔案類型、命中在檔名還是資料夾、檔案多大。
+                nums = ("%d" % (i + 1),
+                        os.path.splitext(r["path"])[1].lstrip(".").upper(),
+                        "📌 檔名" if r["namehit"] else "📁 資料夾",
+                        findpile.fmt_size(r["size"]))
+                badge = ("只有名稱", "#e8eaf2", MUTED)
             else:
                 hits = (str(r["total"]) if len(self.kws) == 1
                         else "%d／%s" % (r["total"],
@@ -854,6 +912,12 @@ class Win(QtWidgets.QMainWindow):
 
     def clear_results(self):
         self.rows = []
+        self.docrows = []
+        self.namerows = []
+        self.sc_name.setEnabled(False)
+        self.sc_name.setText("🏷 只有名稱")
+        self.sc_doc.setChecked(True)
+        self.scope = 0
         self.tbl.setRowCount(0)
         self.wall.clear()
         self.txt.clear()
@@ -902,6 +966,11 @@ class Win(QtWidgets.QMainWindow):
             if self.img_mode:
                 cap = "%s\n%s %s" % (name[:28],
                                      "✓" if r["sure"] else "?", r["detail"])
+            elif r.get("nameonly"):
+                # 這一區沒有內文,寫「命中 0」只會讓人以為搜尋壞了
+                cap = "%s\n%s · %s" % (name[:28],
+                                       "檔名" if r["namehit"] else "資料夾",
+                                       findpile.fmt_size(r["size"]))
             else:
                 cap = "%s\n命中 %d" % (name[:28], r["total"])
             it = QtWidgets.QListWidgetItem(QtGui.QIcon(ph), cap)
@@ -1028,7 +1097,11 @@ class Win(QtWidgets.QMainWindow):
             return
         self.img_mode = True
         self.rows = rows
+        self.docrows, self.namerows = rows, []
         self.kws = []
+        self.sc_doc.setChecked(True)
+        self.sc_name.setEnabled(False)
+        self.sc_name.setText("🏷 只有名稱")
         self._headers(["#", "相似度", "吻合度", "尺寸", "檔案"])
         self._fill_table()
         self.v_grid.setEnabled(bool(rows))
@@ -1084,6 +1157,14 @@ class Win(QtWidgets.QMainWindow):
         if r["src"].startswith("ocr"):
             out.append("<p class='warn'>⚠ 這份是 OCR 辨識的掃描檔,可能有錯字。"
                        "要引用內容請開啟原始檔核對。</p>")
+        if r.get("nameonly"):
+            where = "檔名" if r["namehit"] else "資料夾名稱"
+            out.append("<p style='color:%s'>這個檔案抽不出內文(影片、音檔,"
+                       "或還沒 OCR 的圖片),是靠<b>%s</b>找到的。<br>"
+                       "大小 %s　·　按 Enter 用系統預設程式開啟。</p>"
+                       % (MUTED, where, findpile.fmt_size(r["size"])))
+            self.txt.setHtml("".join(out))
+            return
         segs = findpile.snippets(r["text"], self.kws, 12, 220) if self.kws else []
         if not segs:
             out.append("<p style='color:%s'>(只有檔名命中,內文沒有這個關鍵字)</p>"

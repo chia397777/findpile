@@ -119,7 +119,60 @@ chk("第 1 欄是序號 1", w.tbl.item(0, 0).text() == "1")
 chk("檔案欄帶了資料夾(給 delegate 用)",
     bool(w.tbl.item(0, 4).data(A.FOLDER) is not None))
 chk("欄位標題是文件模式", w.tbl.horizontalHeaderItem(1).text() == "分數")
-chk("狀態列報了筆數", "命中" in w.status.text(), w.status.text()[:60])
+chk("狀態列報了兩區的筆數", "有內文" in w.status.text()
+    and "只有名稱" in w.status.text(), w.status.text()[:70])
+
+print("")
+print("2b. 只有名稱的檔案(影片、音檔、沒 OCR 的圖)")
+# 從索引裡挑一個只會打到 src='name' 的字:拿名稱紀錄的上層資料夾名。
+# 寫死關鍵字的話,換一個資料夾跑這個測試就整段跳過了。
+con = findpile.db_open()
+NAMEKW = None
+for (p,) in con.execute("SELECT path FROM docs WHERE src='name' LIMIT 400"):
+    cand = os.path.basename(os.path.dirname(p))
+    if len(cand) >= 3 and not cand[0].isdigit():
+        NAMEKW = cand
+        break
+if NAMEKW:
+    nrows, nel = findpile.search([NAMEKW], "any", con)
+    nn = [r for r in nrows if r["nameonly"]]
+    print("     關鍵字「%s」:有內文 %d 筆,只有名稱 %d 筆"
+          % (NAMEKW, len(nrows) - len(nn), len(nn)))
+    w._show(w._gen, [NAMEKW], "any", False, nrows, nel)
+    qapp.processEvents()
+    chk("有名稱命中時鈕要啟用", w.sc_name.isEnabled())
+    chk("鈕上有帶筆數", any(c.isdigit() for c in w.sc_name.text()),
+        w.sc_name.text())
+    w.set_scope(1)
+    qapp.processEvents()
+    chk("切到名稱區", w.scope == 1)
+    chk("名稱區欄位標題換掉了",
+        w.tbl.horizontalHeaderItem(1).text() == "類型",
+        w.tbl.horizontalHeaderItem(1).text())
+    chk("名稱區每列都是 nameonly",
+        all(r["nameonly"] for r in w.rows), "%d 列" % len(w.rows))
+    chk("命中位置欄寫了檔名或資料夾",
+        w.tbl.item(0, 2).text() in ("📌 檔名", "📁 資料夾"),
+        w.tbl.item(0, 2).text())
+    chk("大小欄是人看得懂的單位",
+        any(u in w.tbl.item(0, 3).text() for u in ("B", "KB", "MB", "GB")),
+        w.tbl.item(0, 3).text())
+    chk("badge 標了「只有名稱」",
+        w.tbl.item(0, 4).data(A.BADGE)[0] == "只有名稱",
+        w.tbl.item(0, 4).data(A.BADGE))
+    chk("名稱區畫得出來", not w.tbl.grab().isNull())
+    w.tbl.setCurrentCell(0, 4)
+    qapp.processEvents()
+    chk("前後文面板說明抽不出內文", "抽不出內文" in w.txt.toHtml())
+    w.set_scope(0)
+    qapp.processEvents()
+    chk("切回文件區,標題還原",
+        w.tbl.horizontalHeaderItem(1).text() == "分數")
+else:
+    print("     (跳過:索引裡沒有 src='name' 的紀錄,先跑一次 index)")
+con.close()
+w._show(w._gen, [KW], "any", False, rows, el)
+qapp.processEvents()
 
 print("")
 print("3. 強制渲染 —— TwoLine delegate 的 paint() 要真的跑過")

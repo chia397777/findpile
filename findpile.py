@@ -152,6 +152,15 @@ def strip_root(path, root):
     return path[len(pre) + 1:] if _sep_norm(path).startswith(pre + "/") else path
 
 
+def fmt_size(n):
+    """1536000 -> '1.5 MB'。影片動輒幾百 MB,用位元組顯示沒人看得懂。"""
+    n = n or 0
+    for unit, step in (("GB", 1024 ** 3), ("MB", 1024 ** 2), ("KB", 1024)):
+        if n >= step:
+            return "%.1f %s" % (n / step, unit)
+    return "%d B" % n
+
+
 def split_display(rel):
     """切成 (資料夾, 檔名)。反斜線與斜線都認,因為索引可能來自另一個平台。"""
     i = max(rel.rfind("\\"), rel.rfind("/"))
@@ -522,6 +531,17 @@ TESSEXE = _find_tesseract()
 EXT_IMG = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp",
            ".heic", ".heif"}      # HEIC 需要 pillow-heif,見 _heif()
 
+# 影片與音檔。抽不出內文,但「檔名和資料夾名稱」本身就是線索:
+# 2024尾牙/開場.mp4、客戶會議/0312錄音.m4a —— 名字裡就寫明了是什麼。
+EXT_MEDIA = {".mp4", ".mov", ".avi", ".mkv", ".wmv", ".m4v", ".mpg", ".mpeg",
+             ".3gp", ".flv", ".webm", ".mts", ".m2ts", ".ts",
+             ".mp3", ".wav", ".m4a", ".aac", ".flac", ".wma", ".amr"}
+
+# 只收名字、不抽內文的檔案。圖片也在裡面:OCR 過的會被 ocr 指令換成
+# 有內文的紀錄,沒 OCR 過的至少名字查得到。相簿動輒上萬張,不可能全部
+# OCR;少了這一類,沒輪到的那幾千張連檔名都搜不到。
+EXT_NAME = EXT_MEDIA | EXT_IMG
+
 # OCR 範圍的「命名捷徑」,從 config.json 的 ocr_scopes 讀進來:
 #
 #   "ocr_scopes": {
@@ -784,6 +804,11 @@ def db_open():
     con = sqlite3.connect(DB_PATH)
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA synchronous=NORMAL")
+    # 每次搜尋都要把整個內文欄掃一遍(中文沒有空白,FTS5 的 trigram
+    # tokenizer 又只吃 3 字以上的詞,兩個字的關鍵字查出來是 0 筆,
+    # 所以只能 LIKE 全表掃描)。改走 mmap 讓作業系統直接映射檔案,
+    # 少掉一層複製 —— 240 MB 的索引實測 0.60 秒降到 0.46 秒。
+    con.execute("PRAGMA mmap_size=1073741824")
     con.executescript("""
         CREATE TABLE IF NOT EXISTS docs(
             path   TEXT PRIMARY KEY,
@@ -906,14 +931,19 @@ def walk(root, errors=None, cloud=None):
         for f in fn:
             if f.startswith("~$") or f.endswith(".tmp"):
                 continue
-            if os.path.splitext(f)[1].lower() not in EXT_ALL:
+            ext = os.path.splitext(f)[1].lower()
+            if ext not in EXT_ALL and ext not in EXT_NAME:
                 continue
             p = os.path.join(dp, f)
             try:
                 st = os.stat(p)
             except OSError:
                 continue
-            if st.st_size > MAX_BYTES or st.st_size == 0:
+            if st.st_size == 0:
+                continue
+            # 大小上限只管要抽內文的檔。影片動輒一兩百 MB,拿這個上限
+            # 去擋它們,等於又把整批影片排除在索引之外。
+            if ext in EXT_ALL and st.st_size > MAX_BYTES:
                 continue
             yield p, st.st_mtime, st.st_size
 
@@ -972,7 +1002,10 @@ def cmd_index(args):
     if not roots:
         return
     con = db_open()
-    known = {r[0]: (r[1], r[2]) for r in con.execute("SELECT path, mtime, size FROM docs")}
+    # 多帶一個 src:下面要靠它判斷「這張圖已經 OCR 過了」,
+    # 不然 index 會把辨識好的內文覆蓋成空白的名稱紀錄。
+    known = {r[0]: (r[1], r[2], r[3]) for r in
+             con.execute("SELECT path, mtime, size, src FROM docs")}
 
     # 守門必須擋在 --full 前面。--full 的 DELETE 在迴圈外面執行,
     # 守門若放在迴圈裡,紀錄早就被刪掉了 —— 而且還會照常印出
@@ -1000,7 +1033,7 @@ def cmd_index(args):
             known.pop(p, None)
         print("已清空 %s 筆舊紀錄,這些資料夾全部重建。" % format(len(victims), ","))
 
-    found, todo, gone = set(), [], []
+    found, todo, names, gone = set(), [], [], []
     for root in roots:
         if not os.path.isdir(root):
             print("找不到資料夾,略過:%s" % root)
@@ -1010,8 +1043,16 @@ def cmd_index(args):
         for p, mt, sz in walk(root, errs, cloud):
             here.add(p)
             o = known.get(p)
-            if o is None or abs(o[0] - mt) > 1 or o[1] != sz:
+            if o is not None and abs(o[0] - mt) <= 1 and o[1] == sz:
+                continue                         # 沒變,不用重做
+            ext = os.path.splitext(p)[1].lower()
+            if ext in EXT_ALL:
                 todo.append((p, mt, sz))
+            elif o is None or o[2] == "name":
+                # 影片、音檔、還沒 OCR 的圖片:只記名字。
+                # o[2] 不是 "name" 就跳過 —— 那是 OCR 辨識出來的內文,
+                # 覆蓋掉等於把辨識結果丟了。
+                names.append((p, mt, sz, ext, 0, "", None, "name"))
 
         if cloud:
             print("  %s 個檔案只存在 iCloud,本機沒有下載,這次抽不到內文。"
@@ -1052,8 +1093,12 @@ def cmd_index(args):
         con.executemany("DELETE FROM docs WHERE path=?", [(p,) for p in gone])
         con.commit()
 
-    print("掃到 %d 個可讀檔案,其中 %d 個需要抽內文,%d 個已移除。"
-          % (len(found), len(todo), len(gone)))
+    if names:
+        con.executemany(DOCS_INSERT, names)
+        con.commit()
+
+    print("掃到 %d 個檔案,其中 %d 個需要抽內文,%d 個只記名稱,%d 個已移除。"
+          % (len(found), len(todo), len(names), len(gone)))
     if not todo:
         print("索引已是最新。")
         return
@@ -1084,7 +1129,9 @@ def cmd_index(args):
     con.commit()
 
     bad = con.execute("SELECT COUNT(*) FROM docs WHERE err<>''").fetchone()[0]
-    empty = con.execute("SELECT COUNT(*) FROM docs WHERE err='' AND nchars=0").fetchone()[0]
+    # src='name' 的紀錄本來就沒有內文,不是「抽到空白」
+    empty = con.execute("SELECT COUNT(*) FROM docs"
+                        " WHERE err='' AND nchars=0 AND src<>'name'").fetchone()[0]
     con.execute("PRAGMA wal_checkpoint(TRUNCATE)")   # 先落盤再量大小
     mb = os.path.getsize(DB_PATH) / 1024 / 1024
     print("完成,耗時 %.1f 秒。索引檔 %.1f MB。抽取失敗 %d 個、抽到空白 %d 個"
@@ -1154,36 +1201,55 @@ def search(kws, mode="any", con=None, loose=False):
         where = joiner.join(["text LIKE ?"] * len(kws))
         params = ["%%%s%%" % k for k in kws]
 
-    cands = [r[0] for r in con.execute(
-        "SELECT path FROM docs WHERE nchars>0 AND (%s)" % where, params)]
+    # 內文命中:text 一起帶回來。分兩趟(先拿 path 再逐筆 point lookup)
+    # 等於把整個內文欄讀兩遍,常見字實測慢 0.3 秒。
+    hit = {}
+    for p, text, nchars, src, size in con.execute(
+            "SELECT path, text, nchars, src, size FROM docs"
+            " WHERE nchars>0 AND (%s)" % where, params):
+        hit[p] = (text or "", nchars or 0, src or "extract", size or 0)
 
-    # 檔名也算命中(例如查「報價」要讓「報價單-範本.xlsx」浮上來)
-    seen = set(cands)
-    for (p,) in con.execute("SELECT path FROM docs"):
-        if p not in seen and any(k in os.path.basename(p) for k in kws):
-            cands.append(p)
+    # 路徑也算命中,而且是整個路徑不只檔名(查「報價」要讓
+    # 「報價單-範本.xlsx」浮上來,查「2024尾牙」要讓那個資料夾底下的
+    # 照片和影片都找得到)。資料夾名稱的資訊量很高,只比對 basename
+    # 等於把一半的線索丟掉。順帶一提 `k in p` 比
+    # `k in os.path.basename(p)` 快 50 倍:後者對每一列都要呼叫一次函式。
+    for p, nchars, src, size in con.execute(
+            "SELECT path, nchars, src, size FROM docs"):
+        if p in hit or not any(k in p for k in kws):
+            continue
+        if nchars:
+            # 有內文、只是內文沒命中。前後文面板還是要有東西可顯示,
+            # 所以這一類才去取 text —— 數量少,不會變成全表再讀一遍。
+            row = con.execute("SELECT text FROM docs WHERE path=?", (p,)).fetchone()
+            hit[p] = (row[0] or "" if row else "", nchars, src or "extract", size or 0)
+        else:
+            hit[p] = ("", 0, src or "extract", size or 0)
 
     out = []
-    for p in cands:
-        row = con.execute("SELECT text, nchars, src FROM docs WHERE path=?", (p,)).fetchone()
-        if not row:
-            continue
-        text, nchars, src = row[0] or "", row[1] or 0, row[2] or "extract"
+    for p, (text, nchars, src, size) in hit.items():
         counts = {k: (_loose_count(text, k) if loose else text.count(k)) for k in kws}
         total = sum(counts.values())
         base = os.path.basename(p)
         nmatch = sum(1 for k in kws if k in base)
-        if mode == "all" and not all(counts[k] or k in base for k in kws):
+        # 資料夾名稱命中的權重刻意壓低。查一個資料夾名會打到它底下
+        # 幾千張照片,給它跟檔名一樣的 3.0 分,真正的文件會被全部壓下去。
+        dmatch = sum(1 for k in kws if k not in base and k in os.path.dirname(p))
+        if mode == "all" and not all(counts[k] or k in p for k in kws):
             continue
-        if total == 0 and nmatch == 0:
+        if total == 0 and nmatch == 0 and dmatch == 0:
             continue
         kb = max(nchars / 1024, 1.0)
         out.append({
-            "score": total / (kb ** 0.75) + nmatch * 3.0,   # 檔名命中給固定高分
+            "score": total / (kb ** 0.75) + nmatch * 3.0 + dmatch * 0.5,
             "total": total, "counts": counts, "namehit": nmatch,
-            "kb": kb, "path": p, "text": text, "src": src,
+            "dirhit": dmatch, "kb": kb, "path": p, "text": text, "src": src,
+            "size": size, "nameonly": src == "name",
         })
-    out.sort(reverse=True, key=lambda r: (r["score"], r["total"]))
+    # 有內文的排前面,只有名字的排後面 —— 這兩種結果的性質不一樣,
+    # 混在一起排名的話,沒內文的紀錄會把文件稀釋掉。
+    out.sort(reverse=True,
+             key=lambda r: (0 if r["nameonly"] else 1, r["score"], r["total"]))
     return out, time.time() - t0
 
 
@@ -1191,12 +1257,16 @@ def cmd_find(args):
     kws = args.keywords
     con = db_open()        # 下面要問索引是在哪個根目錄建的
     res, el = search(kws, args.mode, con, loose=args.loose)
+    # 「有內文」和「只有名字」分兩區。影片、音檔、沒 OCR 的圖片抽不出
+    # 內文,拿來跟文件一起排名只會互相干擾。
+    docs = [r for r in res if not r["nameonly"]]
+    named = [r for r in res if r["nameonly"]]
     # 攤成舊的 tuple 形式,下面產生報告的程式碼不必改
     scored = [(r["score"], r["total"], r["counts"], r["namehit"],
-               r["kb"], r["path"], r["text"]) for r in res]
+               r["kb"], r["path"], r["text"]) for r in docs]
     top = scored[:args.top]
 
-    head = ("# 搜尋:%s\n\n關鍵字 `%s`(%s)　共 %d 個檔案命中,列出前 %d 名　查詢耗時 %.2f 秒\n"
+    head = ("# 搜尋:%s\n\n關鍵字 `%s`(%s)　內文或檔名命中 %d 個檔案,列出前 %d 名　查詢耗時 %.2f 秒\n"
             % ("、".join(kws), "` `".join(kws),
                "必須全部出現" if args.mode == "all" else "任一出現",
                len(scored), len(top), el))
@@ -1212,6 +1282,19 @@ def cmd_find(args):
         detail = total if len(kws) == 1 else "%d (%s)" % (
             total, " ".join("%s:%d" % (k, c) for k, c in counts.items() if c))
         lines.append("| %d | %.2f | %s%s | %.0fK | `%s` |" % (i, score, detail, tag, kb, rel))
+
+    if named:
+        lines.append("\n---\n\n## 只有名稱命中的檔案(%d 個)\n" % len(named))
+        lines.append("> 影片、音檔、還沒 OCR 的圖片抽不出內文,只能靠檔名和"
+                     "資料夾名稱找。這一區不計分,照路徑排。\n")
+        lines.append("| # | 類型 | 命中位置 | 大小 | 檔案 |")
+        lines.append("| --- | --- | --- | --- | --- |")
+        for i, r in enumerate(sorted(named, key=lambda x: x["path"])[:args.top], 1):
+            rel = strip_root_any(r["path"], droots)
+            where = "📌 檔名" if r["namehit"] else "📁 資料夾"
+            lines.append("| %d | %s | %s | %s | `%s` |"
+                         % (i, os.path.splitext(r["path"])[1].lstrip(".").upper(),
+                            where, fmt_size(r["size"]), rel))
 
     if args.ctx > 0:
         lines.append("\n---\n\n## 前後文摘要\n")
@@ -1231,6 +1314,18 @@ def cmd_find(args):
     # 終端機只印表格,前後文留在報告檔裡
     print("\n".join(lines[:4 + len(top)]))
     print()
+    if named:
+        # 名稱區留在報告檔裡,但終端機至少要講一聲有這一區,
+        # 不然影片和沒 OCR 的圖片等於查到了也沒人知道。
+        kinds = {}
+        for r in named:
+            e = os.path.splitext(r["path"])[1].lstrip(".").upper()
+            kinds[e] = kinds.get(e, 0) + 1
+        top3 = sorted(kinds.items(), key=lambda kv: -kv[1])[:3]
+        print("另有 %d 個檔案只有名稱命中(%s)—— 影片、音檔、還沒 OCR 的圖片,"
+              % (len(named), "、".join("%s %d" % kv for kv in top3)))
+        print("明細在報告檔的「只有名稱命中的檔案」那一節。")
+        print()
 
     if not args.no_report:
         os.makedirs(REPORT_DIR, exist_ok=True)

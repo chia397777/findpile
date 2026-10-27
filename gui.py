@@ -281,14 +281,21 @@ class App:
             if len(self.droots) > 1:
                 lab = findpile.root_label(r["path"], self.droots)
                 folder = ("%s ▸ %s" % (lab, folder)) if folder else lab
-            hits = str(r["total"]) if len(kws) == 1 else "%d／%s" % (
-                r["total"], "·".join(str(v) for v in r["counts"].values()))
+            if r.get("nameonly"):
+                # 影片、音檔、還沒 OCR 的圖片:抽不出內文,「命中 0 次 / 1K 字」
+                # 這種顯示會讓人誤會,改成類型與檔案大小。
+                hits = "📌 檔名" if r["namehit"] else "📁 資料夾"
+                cells = (os.path.splitext(r["path"])[1].lstrip(".").upper(),
+                         hits, findpile.fmt_size(r["size"]), "只有名稱")
+            else:
+                hits = str(r["total"]) if len(kws) == 1 else "%d／%s" % (
+                    r["total"], "·".join(str(v) for v in r["counts"].values()))
+                cells = ("%.1f" % r["score"],
+                         hits + ("　📌" if r["namehit"] else ""),
+                         "%.0fK" % r["kb"],
+                         "OCR" if r["src"].startswith("ocr") else "")
             self.tree.insert("", "end", iid=str(i - 1), values=(
-                i, "%.1f" % r["score"],
-                hits + ("　📌" if r["namehit"] else ""),
-                "%.0fK" % r["kb"],
-                "OCR" if r["src"].startswith("ocr") else "",
-                name, folder),
+                (i,) + cells + (name, folder)),
                 tags=("ocr",) if r["src"].startswith("ocr") else ())
         self.set_status("「%s」(%s%s)　命中 %s 個檔案,顯示前 %d 名　耗時 %.2f 秒"
                         % ("、".join(kws),
@@ -457,6 +464,12 @@ class App:
         if r["src"].startswith("ocr"):
             self.txt.insert("end", "⚠ 這份是 OCR 辨識的掃描檔,可能有錯字。"
                                    "要引用內容請開啟原始檔核對。\n\n", "sep")
+        if r.get("nameonly"):
+            where = "檔名" if r["namehit"] else "資料夾名稱"
+            self.txt.insert("end", "這個檔案抽不出內文(影片、音檔,或還沒 OCR "
+                                   "的圖片),是靠%s找到的。\n\n大小 %s"
+                            % (where, findpile.fmt_size(r["size"])))
+            return
         segs = findpile.snippets(r["text"], self.kws, 12, 220)
         if not segs:
             self.txt.insert("end", "(只有檔名命中,內文沒有這個關鍵字)")
