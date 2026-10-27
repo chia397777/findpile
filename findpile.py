@@ -565,6 +565,34 @@ EXT_MEDIA = {".mp4", ".mov", ".avi", ".mkv", ".wmv", ".m4v", ".mpg", ".mpeg",
              ".3gp", ".flv", ".webm", ".mts", ".m2ts", ".ts",
              ".mp3", ".wav", ".m4a", ".aac", ".flac", ".wma", ".amr"}
 
+# 搜尋結果的「類型」分組。副檔名太細了(.docx/.doc/.odt 其實是同一回事),
+# 介面上的篩選鈕和命令列的 --kind 都用這一份,兩邊才不會各有一套說法。
+# 順序就是介面上顯示的順序。
+KINDS = [
+    ("文件", {".docx", ".doc", ".odt", ".rtf", ".dotx", ".dot", ".docm"}),
+    ("PDF", {".pdf"}),
+    ("試算表", {".xlsx", ".xls", ".ods", ".csv", ".tsv", ".xlsm"}),
+    ("簡報", {".pptx", ".ppt", ".odp", ".potx", ".pptm"}),
+    ("網頁", {".html", ".htm", ".xhtml"}),
+    ("純文字", {".txt", ".md", ".json", ".jsx"}),
+    ("圖片", {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp",
+              ".heic", ".heif", ".gif"}),
+    ("影音", {".mp4", ".mov", ".avi", ".mkv", ".wmv", ".m4v", ".mpg", ".mpeg",
+              ".3gp", ".flv", ".webm", ".mts", ".m2ts", ".ts",
+              ".mp3", ".wav", ".m4a", ".aac", ".flac", ".wma", ".amr"}),
+]
+KIND_NAMES = [k for k, _ in KINDS]
+
+
+def kind_of(path):
+    """這個檔案屬於哪一個類型分組。認不出來就回「其他」。"""
+    e = os.path.splitext(path)[1].lower()
+    for name, exts in KINDS:
+        if e in exts:
+            return name
+    return "其他"
+
+
 # 只收名字、不抽內文的檔案。圖片也在裡面:OCR 過的會被 ocr 指令換成
 # 有內文的紀錄,沒 OCR 過的至少名字查得到。相簿動輒上萬張,不可能全部
 # OCR;少了這一類,沒輪到的那幾千張連檔名都搜不到。
@@ -1241,30 +1269,31 @@ def search(kws, mode="any", con=None, loose=False):
     # 內文命中:text 一起帶回來。分兩趟(先拿 path 再逐筆 point lookup)
     # 等於把整個內文欄讀兩遍,常見字實測慢 0.3 秒。
     hit = {}
-    for p, text, nchars, src, size in con.execute(
-            "SELECT path, text, nchars, src, size FROM docs"
+    for p, text, nchars, src, size, mt in con.execute(
+            "SELECT path, text, nchars, src, size, mtime FROM docs"
             " WHERE nchars>0 AND (%s)" % where, params):
-        hit[p] = (text or "", nchars or 0, src or "extract", size or 0)
+        hit[p] = (text or "", nchars or 0, src or "extract", size or 0, mt or 0)
 
     # 路徑也算命中,而且是整個路徑不只檔名(查「報價」要讓
     # 「報價單-範本.xlsx」浮上來,查「2024尾牙」要讓那個資料夾底下的
     # 照片和影片都找得到)。資料夾名稱的資訊量很高,只比對 basename
     # 等於把一半的線索丟掉。順帶一提 `k in p` 比
     # `k in os.path.basename(p)` 快 50 倍:後者對每一列都要呼叫一次函式。
-    for p, nchars, src, size in con.execute(
-            "SELECT path, nchars, src, size FROM docs"):
+    for p, nchars, src, size, mt in con.execute(
+            "SELECT path, nchars, src, size, mtime FROM docs"):
         if p in hit or not any(k in p for k in kws):
             continue
         if nchars:
             # 有內文、只是內文沒命中。前後文面板還是要有東西可顯示,
             # 所以這一類才去取 text —— 數量少,不會變成全表再讀一遍。
             row = con.execute("SELECT text FROM docs WHERE path=?", (p,)).fetchone()
-            hit[p] = (row[0] or "" if row else "", nchars, src or "extract", size or 0)
+            hit[p] = (row[0] or "" if row else "", nchars, src or "extract",
+                      size or 0, mt or 0)
         else:
-            hit[p] = ("", 0, src or "extract", size or 0)
+            hit[p] = ("", 0, src or "extract", size or 0, mt or 0)
 
     out = []
-    for p, (text, nchars, src, size) in hit.items():
+    for p, (text, nchars, src, size, mtime) in hit.items():
         counts = {k: (_loose_count(text, k) if loose else text.count(k)) for k in kws}
         total = sum(counts.values())
         base = os.path.basename(p)
@@ -1282,6 +1311,7 @@ def search(kws, mode="any", con=None, loose=False):
             "total": total, "counts": counts, "namehit": nmatch,
             "dirhit": dmatch, "kb": kb, "path": p, "text": text, "src": src,
             "size": size, "nameonly": src == "name",
+            "mtime": mtime, "kind": kind_of(p),
         })
     # 有內文的排前面,只有名字的排後面 —— 這兩種結果的性質不一樣,
     # 混在一起排名的話,沒內文的紀錄會把文件稀釋掉。
@@ -1290,17 +1320,59 @@ def search(kws, mode="any", con=None, loose=False):
     return out, time.time() - t0
 
 
+def _parse_day(v, end=False):
+    """'2024-03-12' -> epoch 秒。end=True 時取當天結束,否則取當天開始。"""
+    t = time.strptime(v, "%Y-%m-%d")
+    base = time.mktime(t)
+    return base + 86399 if end else base
+
+
+def filter_rows(rows, kind=None, since=None, until=None, sort="score"):
+    """
+    依類型與修改時間篩選、排序。視窗版和命令列共用,兩邊才不會各有一套說法。
+
+    sort="score" 時完全不動順序 —— search() 已經把有內文的排前面、
+    只有名稱的排後面了,再排一次會把那個分界弄丟。
+    """
+    if kind:
+        rows = [r for r in rows if r["kind"] == kind]
+    if since is not None:
+        rows = [r for r in rows if (r.get("mtime") or 0) >= since]
+    if until is not None:
+        rows = [r for r in rows if (r.get("mtime") or 0) <= until]
+    if sort == "new":
+        rows = sorted(rows, key=lambda r: -(r.get("mtime") or 0))
+    elif sort == "old":
+        rows = sorted(rows, key=lambda r: (r.get("mtime") or 0))
+    return rows
+
+
 def cmd_find(args):
     kws = args.keywords
     con = db_open()        # 下面要問索引是在哪個根目錄建的
     res, el = search(kws, args.mode, con, loose=args.loose)
+    n_raw = len(res)
+    res = filter_rows(res, kind=args.kind,
+                      since=_parse_day(args.since) if args.since else None,
+                      until=_parse_day(args.until, end=True) if args.until else None,
+                      sort=args.sort)
+    if len(res) != n_raw:
+        bits = []
+        if args.kind:
+            bits.append("類型=%s" % args.kind)
+        if args.since:
+            bits.append("自 %s" % args.since)
+        if args.until:
+            bits.append("至 %s" % args.until)
+        print("篩選(%s):%s 筆 -> %s 筆"
+              % ("、".join(bits), format(n_raw, ","), format(len(res), ",")))
     # 「有內文」和「只有名字」分兩區。影片、音檔、沒 OCR 的圖片抽不出
     # 內文,拿來跟文件一起排名只會互相干擾。
     docs = [r for r in res if not r["nameonly"]]
     named = [r for r in res if r["nameonly"]]
     # 攤成舊的 tuple 形式,下面產生報告的程式碼不必改
     scored = [(r["score"], r["total"], r["counts"], r["namehit"],
-               r["kb"], r["path"], r["text"]) for r in docs]
+               r["kb"], r["path"], r["text"], r.get("mtime") or 0) for r in docs]
     top = scored[:args.top]
 
     head = ("# 搜尋:%s\n\n關鍵字 `%s`(%s)　內文或檔名命中 %d 個檔案,列出前 %d 名　查詢耗時 %.2f 秒\n"
@@ -1310,32 +1382,37 @@ def cmd_find(args):
     lines = [head,
              "> 分數 = 命中次數 ÷ 檔案文字量^0.75(＋檔名命中加成)。"
              "分數高＝該關鍵字是這個檔案的主題,而非一本大部頭裡剛好出現的一個詞。\n",
-             "| # | 分數 | 命中 | 文字量 | 檔案 |",
-             "| --- | --- | --- | --- | --- |"]
+             "| # | 分數 | 命中 | 文字量 | 日期 | 檔案 |",
+             "| --- | --- | --- | --- | --- | --- |"]
     droots = display_roots(con)
-    for i, (score, total, counts, nmatch, kb, p, _t) in enumerate(top, 1):
+    for i, (score, total, counts, nmatch, kb, p, _t, mt) in enumerate(top, 1):
         rel = strip_root_any(p, droots)
         tag = " 📌檔名" if nmatch else ""
         detail = total if len(kws) == 1 else "%d (%s)" % (
             total, " ".join("%s:%d" % (k, c) for k, c in counts.items() if c))
-        lines.append("| %d | %.2f | %s%s | %.0fK | `%s` |" % (i, score, detail, tag, kb, rel))
+        day = time.strftime("%Y-%m-%d", time.localtime(mt)) if mt else ""
+        lines.append("| %d | %.2f | %s%s | %.0fK | %s | `%s` |"
+                     % (i, score, detail, tag, kb, day, rel))
 
     if named:
         lines.append("\n---\n\n## 只有名稱命中的檔案(%d 個)\n" % len(named))
         lines.append("> 影片、音檔、還沒 OCR 的圖片抽不出內文,只能靠檔名和"
                      "資料夾名稱找。這一區不計分,照路徑排。\n")
-        lines.append("| # | 類型 | 命中位置 | 大小 | 檔案 |")
-        lines.append("| --- | --- | --- | --- | --- |")
+        lines.append("| # | 類型 | 命中位置 | 大小 | 日期 | 檔案 |")
+        lines.append("| --- | --- | --- | --- | --- | --- |")
         for i, r in enumerate(sorted(named, key=lambda x: x["path"])[:args.top], 1):
             rel = strip_root_any(r["path"], droots)
             where = "📌 檔名" if r["namehit"] else "📁 資料夾"
-            lines.append("| %d | %s | %s | %s | `%s` |"
+            mt = r.get("mtime") or 0
+            lines.append("| %d | %s | %s | %s | %s | `%s` |"
                          % (i, os.path.splitext(r["path"])[1].lstrip(".").upper(),
-                            where, fmt_size(r["size"]), rel))
+                            where, fmt_size(r["size"]),
+                            time.strftime("%Y-%m-%d", time.localtime(mt)) if mt else "",
+                            rel))
 
     if args.ctx > 0:
         lines.append("\n---\n\n## 前後文摘要\n")
-        for i, (score, total, counts, nmatch, kb, p, text) in enumerate(top, 1):
+        for i, (score, total, counts, nmatch, kb, p, text, _mt) in enumerate(top, 1):
             rel = strip_root_any(p, droots)
             lines.append("### %d. %s\n" % (i, split_display(rel)[1]))
             lines.append("`%s`　命中 %d 次 / %.0fK 字\n" % (rel, total, kb))
@@ -1842,6 +1919,12 @@ def main():
     pi.set_defaults(func=cmd_index)
 
     pf = sub.add_parser("find", help="查關鍵字")
+    pf.add_argument("--kind", choices=KIND_NAMES + ["其他"],
+                    help="只看某一類(文件／PDF／試算表／簡報／網頁／純文字／圖片／影音)")
+    pf.add_argument("--since", metavar="YYYY-MM-DD", help="只看這天之後修改的")
+    pf.add_argument("--until", metavar="YYYY-MM-DD", help="只看這天之前修改的")
+    pf.add_argument("--sort", choices=["score", "new", "old"], default="score",
+                    help="score=相關度(預設)、new=最新在前、old=最舊在前")
     pf.add_argument("keywords", nargs="+", help="一個或多個關鍵字")
     pf.add_argument("--mode", choices=["any", "all"], default="any",
                     help="any=任一出現(預設);all=必須全部出現")

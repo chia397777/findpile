@@ -117,7 +117,7 @@ qapp.processEvents()
 chk("表格有填", w.tbl.rowCount() > 0, "%d 列" % w.tbl.rowCount())
 chk("第 1 欄是序號 1", w.tbl.item(0, 0).text() == "1")
 chk("檔案欄帶了資料夾(給 delegate 用)",
-    bool(w.tbl.item(0, 4).data(A.FOLDER) is not None))
+    bool(w.tbl.item(0, A.NAMECOL).data(A.FOLDER) is not None))
 chk("欄位標題是文件模式", w.tbl.horizontalHeaderItem(1).text() == "分數")
 chk("狀態列報了兩區的筆數", "有內文" in w.status.text()
     and "只有名稱" in w.status.text(), w.status.text()[:70])
@@ -158,10 +158,10 @@ if NAMEKW:
         any(u in w.tbl.item(0, 3).text() for u in ("B", "KB", "MB", "GB")),
         w.tbl.item(0, 3).text())
     chk("badge 標了「只有名稱」",
-        w.tbl.item(0, 4).data(A.BADGE)[0] == "只有名稱",
-        w.tbl.item(0, 4).data(A.BADGE))
+        w.tbl.item(0, A.NAMECOL).data(A.BADGE)[0] == "只有名稱",
+        w.tbl.item(0, A.NAMECOL).data(A.BADGE))
     chk("名稱區畫得出來", not w.tbl.grab().isNull())
-    w.tbl.setCurrentCell(0, 4)
+    w.tbl.setCurrentCell(0, A.NAMECOL)
     qapp.processEvents()
     chk("前後文面板說明抽不出內文", "抽不出內文" in w.txt.toHtml())
     w.set_scope(0)
@@ -175,6 +175,59 @@ w._show(w._gen, [KW], "any", False, rows, el)
 qapp.processEvents()
 
 print("")
+print("2c. 類型 / 時間 / 排序")
+kinds = {r["kind"] for r in w.docrows}
+print("     這批結果的類型:%s" % "、".join(sorted(kinds)))
+chk("每筆都有 kind 和 mtime",
+    all(r.get("kind") and "mtime" in r for r in w.docrows[:50]))
+chk("類型選單只列真的有的類型",
+    all(w.f_kind.itemData(i) in kinds or w.f_kind.itemData(i) is None
+        for i in range(w.f_kind.count())),
+    [w.f_kind.itemText(i) for i in range(w.f_kind.count())])
+chk("類型選單帶了筆數", "(" in w.f_kind.itemText(0), w.f_kind.itemText(0))
+chk("表格有日期欄", w.tbl.horizontalHeaderItem(A.DATECOL).text() == "日期")
+d0 = w.tbl.item(0, A.DATECOL).text()
+chk("日期欄是 YYYY-MM-DD", len(d0) == 10 and d0[4] == "-", d0)
+
+pick = None
+for i in range(1, w.f_kind.count()):
+    if w.f_kind.itemData(i):
+        pick = i
+        break
+if pick:
+    want = w.f_kind.itemData(pick)
+    before = w.tbl.rowCount()
+    w.f_kind.setCurrentIndex(pick)          # 觸發 _refilter
+    qapp.processEvents()
+    chk("篩類型後每一列都是那個類型",
+        all(r["kind"] == want for r in w.rows), "%s / %d 列" % (want, len(w.rows)))
+    w.f_kind.setCurrentIndex(0)
+    qapp.processEvents()
+    chk("切回全部會還原", w.tbl.rowCount() == before,
+        "%d -> %d" % (before, w.tbl.rowCount()))
+
+w.f_sort.setCurrentIndex(1)
+qapp.processEvents()
+mts = [r.get("mtime") or 0 for r in w.rows]
+chk("最新在前:時間遞減", mts == sorted(mts, reverse=True), "%d 列" % len(mts))
+w.f_sort.setCurrentIndex(2)
+qapp.processEvents()
+mts = [r.get("mtime") or 0 for r in w.rows]
+chk("最舊在前:時間遞增", mts == sorted(mts), "%d 列" % len(mts))
+w.f_sort.setCurrentIndex(0)
+qapp.processEvents()
+
+import time as _t
+w.f_time.setCurrentIndex(1)                 # 最近 7 天
+qapp.processEvents()
+cut = _t.time() - 7 * 86400
+chk("時間篩選真的有濾掉舊的",
+    all((r.get("mtime") or 0) >= cut for r in w.rows), "剩 %d 列" % len(w.rows))
+w.f_time.setCurrentIndex(0)
+qapp.processEvents()
+chk("時間切回不限會還原", len(w.rows) > 0, "%d 列" % len(w.rows))
+
+print("")
 print("3. 強制渲染 —— TwoLine delegate 的 paint() 要真的跑過")
 pm = w.tbl.grab()
 chk("表格畫得出來", not pm.isNull() and pm.width() > 100,
@@ -185,7 +238,7 @@ chk("整個視窗畫得出來", not pm2.isNull() and pm2.width() > 900,
 
 print("")
 print("4. 點選 -> 前後文面板")
-w.tbl.setCurrentCell(0, 4)
+w.tbl.setCurrentCell(0, A.NAMECOL)
 qapp.processEvents()
 chk("麵包屑有路徑", len(w.crumb.text()) > 3, w.crumb.text()[:50])
 h = w.txt.toHtml()
@@ -279,8 +332,8 @@ else:
     w.set_view(0)
     pm5 = w.tbl.grab()
     chk("圖片模式的列表也畫得出來", not pm5.isNull())
-    chk("✓/? 標籤有存進 BADGE", w.tbl.item(0, 4).data(A.BADGE)[0] == "✓ 相符",
-        w.tbl.item(0, 4).data(A.BADGE))
+    chk("✓/? 標籤有存進 BADGE", w.tbl.item(0, A.NAMECOL).data(A.BADGE)[0] == "✓ 相符",
+        w.tbl.item(0, A.NAMECOL).data(A.BADGE))
     w._show(w._gen, [KW], "any", False, rows, el)
     chk("切回關鍵字模式後標題還原", w.tbl.horizontalHeaderItem(1).text() == "分數")
     chk("img_mode 關掉了", w.img_mode is False)
@@ -296,7 +349,7 @@ chk("舊世代的結果被丟掉", w.tbl.rowCount() == before,
 print("")
 print("11. 雜項")
 w.set_view(0)
-w.tbl.setCurrentCell(0, 4)
+w.tbl.setCurrentCell(0, A.NAMECOL)
 r = w.cur()
 chk("cur() 拿得到選中那筆", r is not None and "path" in r)
 w.copy_path()

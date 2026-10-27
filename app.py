@@ -29,6 +29,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -70,6 +71,18 @@ CARD = "#ffffff"
 LINE = "#e3e1db"      # 分隔線
 TEXT = "#26251f"
 MUTED = "#8a877d"
+
+# 表格欄位。檔案欄永遠是最後一欄(兩行繪製的 delegate 掛在上面),
+# 日期欄在它前面。用常數而不是散落的數字 —— 插一個欄位就要全檔找
+# 「哪個 4 是欄位、哪個 4 是別的東西」,那種錯只會在執行時才炸。
+COLS = ("#", "分數", "命中", "字數", "日期", "檔案")
+DATECOL = len(COLS) - 2
+NAMECOL = len(COLS) - 1
+
+# 時間篩選的選項。值是天數,None = 不限。
+SPANS = [("不限", None), ("最近 7 天", 7), ("最近 30 天", 30),
+         ("最近一年", 365), ("最近三年", 365 * 3)]
+SORTS = ["相關度", "最新在前", "最舊在前"]
 ACCENT = "#1a5490"
 ACCENT_D = "#143f69"
 SEL = "#e4eef8"       # 選取列
@@ -555,6 +568,48 @@ class Win(QtWidgets.QMainWindow):
                                      objectName="hint")
         row.addWidget(self.hint)
         v.addLayout(row)
+
+        # ---- 第二列:類型 / 時間 / 排序
+        # 一次查出幾千筆的時候,真正缺的不是更準的排名,是「只看 PDF」
+        # 或「只看今年」。這三個都在記憶體裡篩,不重查資料庫,所以是即時的。
+        row2 = QtWidgets.QHBoxLayout()
+        row2.setSpacing(8)
+
+        def lab(t):
+            w = QtWidgets.QLabel(t, objectName="hint")
+            row2.addWidget(w)
+
+        lab("類型")
+        self.f_kind = QtWidgets.QComboBox()
+        self.f_kind.setMinimumWidth(132)
+        self.f_kind.addItem("全部", None)
+        row2.addWidget(self.f_kind)
+        row2.addSpacing(10)
+
+        lab("時間")
+        self.f_time = QtWidgets.QComboBox()
+        self.f_time.setMinimumWidth(104)
+        for t, d in SPANS:
+            self.f_time.addItem(t, d)
+        self.f_time.setToolTip("依檔案的修改時間篩選")
+        row2.addWidget(self.f_time)
+        row2.addSpacing(10)
+
+        lab("排序")
+        self.f_sort = QtWidgets.QComboBox()
+        self.f_sort.setMinimumWidth(104)
+        self.f_sort.addItems(SORTS)
+        self.f_sort.setToolTip("「相關度」是預設的分數排序;"
+                               "只有名稱的那一區沒有分數,照路徑排")
+        row2.addWidget(self.f_sort)
+
+        for c in (self.f_kind, self.f_time, self.f_sort):
+            c.currentIndexChanged.connect(self._refilter)
+
+        row2.addStretch(1)
+        self.fcount = QtWidgets.QLabel("", objectName="hint")
+        row2.addWidget(self.fcount)
+        v.addLayout(row2)
         return box
 
     def _split(self):
@@ -569,7 +624,10 @@ class Win(QtWidgets.QMainWindow):
         self.views = QtWidgets.QStackedWidget()
 
         # ---- 列表
-        self.tbl = QtWidgets.QTableWidget(0, 5)
+        # 欄位:# / 分數 / 命中 / 字數 / 日期 / 檔案
+        # 檔案欄的索引用常數,不要散落一堆 4、5 —— 之前插一個欄位就得
+        # 全檔找一遍哪個 4 是欄位、哪個 4 是別的東西。
+        self.tbl = QtWidgets.QTableWidget(0, len(COLS))
         self._headers(["#", "分數", "命中", "字數", "檔案"])
         self.tbl.verticalHeader().setVisible(False)
         self.tbl.setShowGrid(False)
@@ -578,15 +636,15 @@ class Win(QtWidgets.QMainWindow):
         self.tbl.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
         self.tbl.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.tbl.setWordWrap(False)
-        self.tbl.setItemDelegateForColumn(4, TwoLine(self.tbl))
+        self.tbl.setItemDelegateForColumn(NAMECOL, TwoLine(self.tbl))
         self.tbl.verticalHeader().setDefaultSectionSize(46)
         h = self.tbl.horizontalHeader()
         # 命中欄放得下「222／203·19　📌」—— 太窄的話尾巴被截掉,
         # 檔名命中的 📌 就看不到了
-        for c, w in ((0, 46), (1, 76), (2, 132), (3, 72)):
+        for c, w in ((0, 46), (1, 76), (2, 132), (3, 72), (DATECOL, 96)):
             self.tbl.setColumnWidth(c, w)
             h.setSectionResizeMode(c, QtWidgets.QHeaderView.Fixed)
-        h.setSectionResizeMode(4, QtWidgets.QHeaderView.Stretch)
+        h.setSectionResizeMode(NAMECOL, QtWidgets.QHeaderView.Stretch)
         self.tbl.itemSelectionChanged.connect(self.on_pick)
         self.tbl.doubleClicked.connect(self.open_file)
         self.views.addWidget(self.tbl)
@@ -821,7 +879,59 @@ class Win(QtWidgets.QMainWindow):
             if self.namerows else "這次沒有只靠名稱命中的檔案")
         # 文件沒命中、名稱有命中,就直接切到名稱區 —— 不然畫面是空的,
         # 看起來像「查不到」,其實旁邊按鈕裡有幾百筆。
+        self._rebuild_kinds()
         self.set_scope(1 if not self.docrows and self.namerows else 0)
+
+    def _refilter(self):
+        """三個下拉選單共用。只重排現有結果,不重查資料庫。"""
+        if self.docrows or self.namerows:
+            self.set_scope(self.scope)
+
+    def _rebuild_kinds(self):
+        """
+        把類型選單換成「這批結果裡真的有的類型」,並帶上筆數。
+
+        固定列出全部八個類型沒有用 —— 查一個詞得到 2,124 筆,人想知道的是
+        「裡面有 693 個 PDF」,不是「有沒有簡報這個選項」。
+
+        換內容會觸發 currentIndexChanged,所以整段要擋訊號,
+        不然每搜尋一次就會多跑一輪篩選(而且是半成品狀態)。
+        """
+        cur = self.f_kind.currentText().split(" ")[0]
+        counts = {}
+        for r in self.docrows + self.namerows:
+            counts[r["kind"]] = counts.get(r["kind"], 0) + 1
+        self.f_kind.blockSignals(True)
+        try:
+            self.f_kind.clear()
+            total = len(self.docrows) + len(self.namerows)
+            self.f_kind.addItem("全部 (%s)" % format(total, ","), None)
+            for name in findpile.KIND_NAMES + ["其他"]:
+                if counts.get(name):
+                    self.f_kind.addItem("%s (%s)" % (name, format(counts[name], ",")),
+                                        name)
+            # 盡量留在使用者原本選的那個類型上
+            for i in range(self.f_kind.count()):
+                if self.f_kind.itemData(i) == (cur if cur != "全部" else None):
+                    self.f_kind.setCurrentIndex(i)
+                    break
+        finally:
+            self.f_kind.blockSignals(False)
+
+    def _filtered(self, rows):
+        kind = self.f_kind.currentData()
+        if kind:
+            rows = [r for r in rows if r["kind"] == kind]
+        days = self.f_time.currentData()
+        if days:
+            cut = time.time() - days * 86400
+            rows = [r for r in rows if (r.get("mtime") or 0) >= cut]
+        i = self.f_sort.currentIndex()
+        if i == 1:
+            rows = sorted(rows, key=lambda r: -(r.get("mtime") or 0))
+        elif i == 2:
+            rows = sorted(rows, key=lambda r: (r.get("mtime") or 0))
+        return rows
 
     def set_scope(self, which):
         """0 = 有內文的文件,1 = 只有名稱的檔案(影片、音檔、未 OCR 的圖)。"""
@@ -829,10 +939,11 @@ class Win(QtWidgets.QMainWindow):
             which = 0
         (self.sc_doc if which == 0 else self.sc_name).setChecked(True)
         self.scope = which
-        src = self.namerows if which else self.docrows
+        src = self._filtered(self.namerows if which else self.docrows)
+        self.nshown = len(src)
         self.rows = src[:300]
-        self._headers(["#", "分數", "命中", "字數", "檔案"] if which == 0
-                      else ["#", "類型", "命中位置", "大小", "檔案"])
+        self._headers(list(COLS) if which == 0
+                      else ["#", "類型", "命中位置", "大小", "日期", "檔案"])
         self._fill_table()
         nimg = sum(1 for r in self.rows if is_img(r["path"]))
         self.v_grid.setEnabled(nimg > 0)
@@ -847,6 +958,11 @@ class Win(QtWidgets.QMainWindow):
                "+模糊" if loose else "", format(len(self.docrows), ","),
                format(len(self.namerows), ","), kind, len(self.rows), el,
                "　·　其中 %d 個是圖片,可切「▦ 縮圖」" % nimg if nimg else ""))
+        # 篩掉了多少要講出來。只改變畫面卻不說明,看起來就像「結果變少了」
+        n_all = len(self.namerows if which else self.docrows)
+        self.fcount.setText("" if self.nshown == n_all
+                            else "篩選後 %s／%s 筆"
+                                 % (format(self.nshown, ","), format(n_all, ",")))
         self.set_view(1 if which == 1 and nimg == len(self.rows) and nimg else 0)
         self.select_first()
 
@@ -894,12 +1010,19 @@ class Win(QtWidgets.QMainWindow):
                 if c == 0:
                     it.setForeground(QtGui.QColor(MUTED))
                 self.tbl.setItem(i, c, it)
+            mt = r.get("mtime") or 0
+            d = QtWidgets.QTableWidgetItem(
+                time.strftime("%Y-%m-%d", time.localtime(mt)) if mt else "")
+            d.setTextAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+            d.setForeground(QtGui.QColor(MUTED))
+            self.tbl.setItem(i, DATECOL, d)
+
             it = QtWidgets.QTableWidgetItem(name)
             it.setData(FOLDER, folder)
             it.setData(BADGE, badge)
             it.setData(ROWIDX, i)
             it.setToolTip(r["path"])
-            self.tbl.setItem(i, 4, it)
+            self.tbl.setItem(i, NAMECOL, it)
 
     def _name_of(self, path):
         """路徑拆成 (資料夾, 檔名),多來源時前面加上來源標籤。"""
@@ -930,7 +1053,7 @@ class Win(QtWidgets.QMainWindow):
                 self.wall.setCurrentRow(0)
                 self.wall.setFocus()
         elif self.tbl.rowCount():
-            self.tbl.setCurrentCell(0, 4)
+            self.tbl.setCurrentCell(0, NAMECOL)
             self.tbl.setFocus()
 
     # ------------------------------------------------------- 列表 / 縮圖
@@ -1098,11 +1221,13 @@ class Win(QtWidgets.QMainWindow):
         self.img_mode = True
         self.rows = rows
         self.docrows, self.namerows = rows, []
+        self.nshown = len(rows)
+        self.fcount.setText("")
         self.kws = []
         self.sc_doc.setChecked(True)
         self.sc_name.setEnabled(False)
         self.sc_name.setText("🏷 只有名稱")
-        self._headers(["#", "相似度", "吻合度", "尺寸", "檔案"])
+        self._headers(["#", "相似度", "吻合度", "尺寸", "日期", "檔案"])
         self._fill_table()
         self.v_grid.setEnabled(bool(rows))
         self.v_grid.setToolTip("用縮圖牆一眼掃過全部結果")
