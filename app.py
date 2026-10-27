@@ -469,6 +469,8 @@ class Win(QtWidgets.QMainWindow):
         self._stale_at = 0.0     # 上次檢查索引是否過期的時間
         self._stale_t = None     # 檢查用的背景執行緒(和搜尋分開放)
         self._idx_t = None       # 更新索引用的背景執行緒
+        self._idx_busy = False   # 索引正在更新(自動那次不走 busy 計數)
+        self._busy_n = 0         # 進行中的前景工作數(搜尋 / 以圖搜圖)
         self._nstale = 0
         self.kws = []
         self.droots = [findpile.DEFAULT_ROOT]
@@ -655,7 +657,7 @@ class Win(QtWidgets.QMainWindow):
         # 檔案欄的索引用常數,不要散落一堆 4、5 —— 之前插一個欄位就得
         # 全檔找一遍哪個 4 是欄位、哪個 4 是別的東西。
         self.tbl = QtWidgets.QTableWidget(0, len(COLS))
-        self._headers(["#", "分數", "命中", "字數", "檔案"])
+        self._headers(list(COLS))
         self.tbl.verticalHeader().setVisible(False)
         self.tbl.setShowGrid(False)
         self.tbl.setAlternatingRowColors(True)
@@ -844,18 +846,26 @@ class Win(QtWidgets.QMainWindow):
         self.status.setText(s)
 
     def busy(self, on):
-        # 三條背景執行緒共用這個開關。關掉之前要先確認沒有別人還在忙 ——
-        # 否則「更新索引完成 -> 自動重搜 -> 更新那條的 finished 才送到」
-        # 會在搜尋還沒回來的時候就把按鈕全部打開。
-        if not on and self._task is not None and self._task.isRunning():
-            return
-        self.btn_go.setEnabled(not on)
-        self.btn_img.setEnabled(not on)
-        if not (self._idx_t is not None and self._idx_t.isRunning()):
-            self.btn_idx.setEnabled(not on)
+        """
+        三條背景執行緒共用的忙碌開關。
+
+        用「進行中的工作數」計數,**不要去問執行緒的 isRunning()**:
+        `Task.finished` 是在 `run()` 收尾時發出來的,那一刻 `isRunning()`
+        還是 True。拿它當「還有人在忙」的判斷,每次搜尋結束都會提早
+        return —— 按鈕永遠解不了鎖,狀態列停在「搜尋中…」。
+        (這是實際發生過的回歸,不是假想。)
+
+        索引那條用 `_idx_busy` 旗標而不是計數:自動更新刻意不呼叫
+        busy(True),所以它不在這個計數裡。
+        """
+        self._busy_n = max(0, self._busy_n + (1 if on else -1))
+        idle = self._busy_n == 0
+        self.btn_go.setEnabled(idle)
+        self.btn_img.setEnabled(idle)
+        self.btn_idx.setEnabled(idle and not self._idx_busy)
         # 進度條的擁有權跟著工作走:索引還在跑就別把它收掉,
         # 不然使用者搜尋一次就以為索引更新完了。
-        if not on and not (self._idx_t is not None and self._idx_t.isRunning()):
+        if idle and not self._idx_busy:
             self.prog.setVisible(False)
 
     def check_stale(self, force=False):
@@ -1034,6 +1044,7 @@ class Win(QtWidgets.QMainWindow):
             self.busy(True)
         # 「自動那次不鎖按鈕」只該豁免搜尋,不該豁免索引按鈕自己 ——
         # 不然畫面上還亮著「⟳ 更新索引 (1,234)」在催人按第二次。
+        self._idx_busy = True
         self.btn_idx.setEnabled(False)
         self.prog.setVisible(True)
         self.prog.setRange(0, 0)             # 總量未知,先跑馬燈
@@ -1064,7 +1075,10 @@ class Win(QtWidgets.QMainWindow):
         t.start()
 
     def _idx_finished(self):
-        self.btn_idx.setEnabled(True)
+        self._idx_busy = False
+        self.btn_idx.setEnabled(self._busy_n == 0)
+        if self._busy_n == 0:
+            self.prog.setVisible(False)
 
     def _reindex_failed(self, msg):
         # 自動更新失敗不要彈視窗擋在使用者面前 —— 他只是想開程式查東西

@@ -408,6 +408,34 @@ finally:
 
 print("")
 print("")
+print("2h. 真的走一次背景執行緒(前面的測試都繞過 go(),所以漏掉了這個)")
+# 這一節存在的理由:busy(False) 曾經在 Task.finished 裡去問
+# self._task.isRunning() —— 那一刻執行緒還是 running,所以每次搜尋
+# 結束都提早 return,按鈕永遠解不了鎖、狀態列停在「搜尋中…」。
+# 直接呼叫 _show() 的測試完全看不到這件事。
+w.kw.setText(KW)
+w.go()
+chk("搜尋期間按鈕會鎖住", not w.btn_go.isEnabled())
+_t0 = time.time()
+while w._task is not None and w._task.isRunning() and time.time() - _t0 < 60:
+    qapp.processEvents()
+    QtCore.QThread.msleep(30)
+for _ in range(20):                       # 讓 finished / done 的 queued 訊號送達
+    qapp.processEvents()
+    QtCore.QThread.msleep(20)
+chk("搜尋結束後按鈕解鎖", w.btn_go.isEnabled(), "耗時 %.1f 秒" % (time.time() - _t0))
+chk("以圖搜圖鈕也解鎖", w.btn_img.isEnabled())
+chk("更新索引鈕也解鎖", w.btn_idx.isEnabled())
+chk("狀態列不再是「搜尋中」", "搜尋中" not in w.status.text(),
+    w.status.text()[:50])
+chk("結果有填進表格", w.tbl.rowCount() > 0, "%d 列" % w.tbl.rowCount())
+chk("忙碌計數歸零", w._busy_n == 0, w._busy_n)
+chk("最後一欄標題是「檔案」",
+    w.tbl.horizontalHeaderItem(A.NAMECOL).text() == "檔案",
+    w.tbl.horizontalHeaderItem(A.NAMECOL).text())
+
+print("")
+print("")
 print("3. 強制渲染 —— TwoLine delegate 的 paint() 要真的跑過")
 pm = w.tbl.grab()
 chk("表格畫得出來", not pm.isNull() and pm.width() > 100,
