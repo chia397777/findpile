@@ -1674,7 +1674,23 @@ def main():
     ap.add_argument("--root", default=DEFAULT_ROOT, help="要掃的根目錄(預設:本工具的上層資料夾)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
+    def root_too(p):
+        """
+        讓 `findpile 子指令 --root X` 也能用。
+
+        argparse 的全域選項一定要寫在子指令前面,否則直接報
+        「unrecognized arguments: --root …」。這個規則沒道理可言,
+        每次都要停下來想一下哪個在前面。
+
+        default=SUPPRESS 的意思是「沒給就完全不碰這個屬性」,
+        所以上面那個全域的值會留著。寫 default=None 會把它蓋成 None。
+        """
+        p.add_argument("--root", default=argparse.SUPPRESS,
+                       help="要掃的根目錄(也可以寫在子指令前面)")
+        return p
+
     pi = sub.add_parser("index", help="建立/更新索引")
+    root_too(pi)
     pi.add_argument("--full", action="store_true", help="清空重建")
     pi.add_argument("--workers", type=int, default=8, help="並行數(預設 8)")
     pi.add_argument("--dir", action="append", metavar="資料夾",
@@ -1703,6 +1719,7 @@ def main():
     pf.set_defaults(func=cmd_find)
 
     po = sub.add_parser("ocr", help="對掃描檔／圖片做 OCR,結果併入索引")
+    root_too(po)
     po.add_argument("--scope", default=".",
                     help="要辨識的目錄(相對 root,或絕對路徑)。也可以用 "
                          "config.json 的 ocr_scopes 取好的名字,或 pdf"
@@ -1736,6 +1753,7 @@ def main():
     pm.set_defaults(func=cmd_merge)
 
     pii = sub.add_parser("imgindex", help="建立圖片特徵(以圖搜圖用)")
+    root_too(pii)
     pii.add_argument("--dir", action="append", metavar="資料夾",
                      help="要建特徵的資料夾,可重複指定;不給就用 --root")
     pii.add_argument("--redo", action="store_true", help="已建好的也重算")
