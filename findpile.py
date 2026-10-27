@@ -779,7 +779,12 @@ def cmd_ocr(args):
                 print("找不到目錄,略過:%s" % r)
                 continue
             for dp, dn, fn in os.walk(r):
-                dn[:] = [d for d in dn if d not in SKIP_DIRS]
+                # 一定要用 _skip_dir(),不能只比 SKIP_DIRS 成員。
+                # 自己寫一份的話會漏掉「.」「$」開頭與 macOS 套件後綴,
+                # 於是 OCR 收了那些目錄、下一次 index 的 _is_skipped()
+                # 卻判定它們該排除 -> 辨識結果被整批刪掉,畫面只印
+                # 一行「N 個已移除」。排除規則只能有一個來源。
+                dn[:] = [d for d in dn if not _skip_dir(d)]
                 for f in fn:
                     if os.path.splitext(f)[1].lower() in EXT_IMG and not f.startswith("~$"):
                         targets.append(os.path.join(dp, f))
@@ -1043,6 +1048,17 @@ def _is_skipped(p, root):
     return any(_skip_dir(d) for d in rel.split(os.sep)[:-1])
 
 
+def is_ocr(src):
+    """
+    這筆紀錄是不是 OCR 辨識出來的。
+
+    OCR 很貴 —— 一張圖幾秒,整庫是十幾個小時。所以任何會「覆蓋」或
+    「刪除」紀錄的路徑,都要先問這一句。這個函式存在的理由不是省事,
+    是讓那條規則只有一個地方可以改。
+    """
+    return bool(src) and str(src).startswith("ocr")
+
+
 def is_borrowed_root(root):
     """
     這個根目錄是不是「索引是從別台複製來、原始檔不在這台」的那一份。
@@ -1066,7 +1082,9 @@ def cmd_index(args, say=None):
     進度轉成 signal 送到狀態列 —— **不要改 sys.stdout**:那是全域的,
     在背景執行緒換掉它,主執行緒同一時間印的東西也會一起被吃掉。
     """
-    say = say or print
+    # 預設帶 flush:輸出被導到檔案或管線時 stdout 會緩衝 8KB,
+    # 幾千個檔案的進度會全部憋到最後才吐出來。
+    say = say or (lambda *a: print(*a, flush=True))
     roots = guard_roots(index_targets(args))
     if not roots:
         return
@@ -1094,15 +1112,27 @@ def cmd_index(args, say=None):
         roots = keep
 
     if args.full:
-        # 只清掉這次要重建的根目錄,不要動索引裡其他來源的紀錄
-        victims = [p for p in known if any(_under(p, r) for r in roots)]
+        # 只清掉這次要重建的根目錄,不要動索引裡其他來源的紀錄。
+        #
+        # 而且不碰 OCR 紀錄:--full 的語意是「內文重抽一次」,OCR 不是抽
+        # 來的,是辨識出來的。少了這個條件,一句 --full 就把整庫的辨識
+        # 成果刪光,接著迴圈掃到同一批圖片、known 已經 pop 掉,於是寫回
+        # 空白的名稱紀錄 —— 畫面只印「已清空 N 筆舊紀錄」,看起來很正常。
+        spared = [p for p in known
+                  if any(_under(p, r) for r in roots) and is_ocr(known[p][2])]
+        victims = [p for p in known
+                   if any(_under(p, r) for r in roots) and not is_ocr(known[p][2])]
         con.executemany("DELETE FROM docs WHERE path=?", [(p,) for p in victims])
         con.commit()
         for p in victims:
             known.pop(p, None)
         say("已清空 %s 筆舊紀錄,這些資料夾全部重建。" % format(len(victims), ","))
+        if spared:
+            say("  保留 %s 筆 OCR 辨識結果(--full 不重做 OCR,"
+                "要重做請用 ocr --redo)。" % format(len(spared), ","))
 
     found, todo, names, gone = set(), [], [], []
+    keep_ocr = 0                 # 檔案變了、但因為是 OCR 紀錄而刻意不重抽的
     for root in roots:
         if not os.path.isdir(root):
             say("找不到資料夾,略過:%s" % root)
@@ -1115,7 +1145,14 @@ def cmd_index(args, say=None):
             if o is not None and abs(o[0] - mt) <= 1 and o[1] == sz:
                 continue                         # 沒變,不用重做
             ext = os.path.splitext(p)[1].lower()
-            if ext in EXT_ALL:
+            if is_ocr(o[2] if o else None):
+                # 這一筆是 OCR 辨識出來的,檔案變了也不要用 extract 覆蓋。
+                # 掃描影像 PDF 最明顯:extract 抽出來是空字串,一覆蓋就
+                # 把辨識好的內文換成空白,而且 stats 只會把它算回
+                # 「抽到空白」,完全看不出發生過什麼事。
+                # 真的要重做,ocr --redo 才是正確的路徑。
+                keep_ocr += 1
+            elif ext in EXT_ALL:
                 todo.append((p, mt, sz))
             elif o is None or o[2] == "name":
                 # 影片、音檔、還沒 OCR 的圖片:只記名字。
@@ -1172,6 +1209,10 @@ def cmd_index(args, say=None):
 
     say("掃到 %d 個檔案,其中 %d 個需要抽內文,%d 個只記名稱,%d 個已移除。"
           % (len(found), len(todo), len(names), len(gone)))
+    if keep_ocr:
+        # 不講的話,使用者會以為那些檔案已經更新了
+        say("  另有 %d 個檔案變動過,但內容是 OCR 辨識來的,這次保留不重抽。"
+            % keep_ocr)
     if not todo:
         say("索引已是最新。")
         return
@@ -1318,7 +1359,10 @@ def search(kws, mode="any", con=None, loose=False):
             "score": total / (kb ** 0.75) + nmatch * 3.0 + dmatch * 0.5,
             "total": total, "counts": counts, "namehit": nmatch,
             "dirhit": dmatch, "kb": kb, "path": p, "text": text, "src": src,
-            "size": size, "nameonly": src == "name",
+            # 沒有內文可以餵前後文面板的,就歸名稱區 —— 包含 OCR 過但
+            # 一個字都沒讀到的照片(本機有 215 張)。只看 src == "name"
+            # 的話,那些會落到文件區顯示成「命中 0 次 / 1K 字」。
+            "size": size, "nameonly": src == "name" or not nchars,
             "mtime": mtime, "kind": kind_of(p),
         })
     # 有內文的排前面,只有名字的排後面 —— 這兩種結果的性質不一樣,
@@ -1574,10 +1618,27 @@ def cmd_merge(args):
         print("目前索引 %s 筆,來源 %s 筆,合併中…"
               % (format(before, ","), format(add, ",")))
         sel_src = "src" if "src" in scols else "'extract'"
-        con.execute("INSERT OR REPLACE INTO docs"
-                    "(path,mtime,size,ext,nchars,err,text,src) "
-                    "SELECT path,mtime,size,ext,nchars,err,text,%s FROM src.docs"
-                    % sel_src)
+        # 不能無條件 INSERT OR REPLACE:把 OCR 之前打包出去的索引 merge
+        # 回來時,來源那邊同一個路徑是空白的名稱紀錄,會直接蓋掉現有的
+        # 辨識結果。規則:有內文的不可以被沒內文的取代,OCR 的不可以被
+        # 非 OCR 的取代。
+        con.execute("""
+            INSERT INTO docs(path,mtime,size,ext,nchars,err,text,src)
+            SELECT path,mtime,size,ext,nchars,err,text,%s FROM src.docs
+            WHERE true
+            ON CONFLICT(path) DO UPDATE SET
+                mtime=excluded.mtime, size=excluded.size, ext=excluded.ext,
+                nchars=excluded.nchars, err=excluded.err,
+                text=excluded.text, src=excluded.src
+            WHERE excluded.nchars > 0
+              AND NOT (docs.src LIKE 'ocr%%' AND excluded.src NOT LIKE 'ocr%%')
+        """ % sel_src)
+        kept = con.execute(
+            "SELECT COUNT(*) FROM src.docs s JOIN docs d USING(path)"
+            " WHERE d.src LIKE 'ocr%' AND s.src NOT LIKE 'ocr%'").fetchone()[0]
+        if kept:
+            print("  保留 %s 筆本機的 OCR 紀錄(來源那邊是較弱的紀錄)。"
+                  % format(kept, ","))
 
         # 來源的根目錄清單也要併過來,否則顯示路徑時去不掉前綴
         # 來源可能是舊格式,只記了單數的 root。查不到 roots 時是回傳

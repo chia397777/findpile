@@ -523,7 +523,10 @@ class Win(QtWidgets.QMainWindow):
         self.btn_idx.setToolTip(
             "重新掃描索引收錄過的資料夾,把新增和修改過的檔案收進來。\n"
             "索引是一份快照,不會自己更新 —— 剛存的檔案要跑過這個才搜得到。")
-        self.btn_idx.clicked.connect(self.reindex)
+        # clicked 會把 checked 當第一個位置引數傳進來。現在是 False、
+        # 剛好等於 auto=False,但那是運氣 —— 哪天改成 checkable 就會變成
+        # auto=True,直接跳過所有確認對話框。
+        self.btn_idx.clicked.connect(lambda: self.reindex(False))
 
         self.btn_img = QtWidgets.QPushButton("📷 以圖搜圖")
         self.btn_img.setToolTip("選一張照片,或直接把圖拖進視窗 / 按 Ctrl+V 貼上")
@@ -841,10 +844,18 @@ class Win(QtWidgets.QMainWindow):
         self.status.setText(s)
 
     def busy(self, on):
+        # 三條背景執行緒共用這個開關。關掉之前要先確認沒有別人還在忙 ——
+        # 否則「更新索引完成 -> 自動重搜 -> 更新那條的 finished 才送到」
+        # 會在搜尋還沒回來的時候就把按鈕全部打開。
+        if not on and self._task is not None and self._task.isRunning():
+            return
         self.btn_go.setEnabled(not on)
         self.btn_img.setEnabled(not on)
-        self.btn_idx.setEnabled(not on)
-        if not on:
+        if not (self._idx_t is not None and self._idx_t.isRunning()):
+            self.btn_idx.setEnabled(not on)
+        # 進度條的擁有權跟著工作走:索引還在跑就別把它收掉,
+        # 不然使用者搜尋一次就以為索引更新完了。
+        if not on and not (self._idx_t is not None and self._idx_t.isRunning()):
             self.prog.setVisible(False)
 
     def check_stale(self, force=False):
@@ -862,7 +873,6 @@ class Win(QtWidgets.QMainWindow):
             return
         if not force and time.time() - self._stale_at < 60:
             return
-        self._stale_at = time.time()
 
         def work(_t):
             con = findpile.db_open()
@@ -885,6 +895,10 @@ class Win(QtWidgets.QMainWindow):
         t.start()
 
     def _stale_done(self, n):
+        # 時間戳打在「掃完」而不是「開始掃」。打在起點的話,只要這次掃描
+        # 本身超過 60 秒(網路磁碟、檔案數變多),之後每次切回視窗都已經
+        # 過了門檻,等於連續不斷在掃。
+        self._stale_at = time.time()
         self._nstale = n
         # 開窗後第一次檢查完,有東西要更新就自己跑,不用人按。
         #
@@ -909,6 +923,34 @@ class Win(QtWidgets.QMainWindow):
             "按一下重新掃描。" % format(n, ",") if n else
             "重新掃描索引收錄過的資料夾。索引是一份快照,不會自己更新。")
 
+    def closeEvent(self, e):
+        """
+        關窗前把背景執行緒收乾淨。
+
+        三條 Task 的 parent 都是這個視窗,視窗解構時它們會在 isRunning()
+        為真的狀態下被刪 —— C++ 端印「QThread: Destroyed while thread is
+        still running」然後常常直接 abort,而且 Python 解譯器同時在收尾,
+        會踩到 Fatal Python error。自動更新索引是分鐘級的,使用者在那期間
+        按 X 幾乎必中。
+        """
+        running = [t for t in (self._task, self._stale_t, self._idx_t)
+                   if t is not None and t.isRunning()]
+        if self._idx_t is not None and self._idx_t.isRunning():
+            if QtWidgets.QMessageBox.question(
+                    self, "索引還在更新",
+                    "索引正在更新中,現在關閉會中斷它(已經寫進去的不會壞,"
+                    "沒做完的部分下次再補)。\n\n要關閉嗎?",
+                    QtWidgets.QMessageBox.Ok | QtWidgets.QMessageBox.Cancel
+            ) != QtWidgets.QMessageBox.Ok:
+                e.ignore()
+                return
+        self._pool.clear()
+        self._pool.waitForDone(3000)
+        for t in running:
+            t.quit()
+            t.wait(5000)                     # 等不到也要走,不能卡在關窗
+        super().closeEvent(e)
+
     def event(self, e):
         # 視窗重新取得焦點時查一次:存完檔切回來,馬上就知道要不要更新。
         # 今天的實際情形是「存了檔、搜不到、以為程式壞了」,就是少了這一下。
@@ -919,6 +961,11 @@ class Win(QtWidgets.QMainWindow):
     def reindex(self, auto=False):
         """
         背景重掃索引。auto=True 是開窗時自動跑的那一次,不問人。
+
+        同一時間只能有一條 —— 兩個 cmd_index 同時寫同一個 sqlite,
+        WAL 只容許單一 writer,而且兩邊各拿自己的 known 快照去算「哪些
+        不見了」再 DELETE。自動更新期間按鈕是亮的(刻意不鎖搜尋),
+        所以這條防護不是理論上的:按一下就會發生。
 
         掃哪些資料夾?用索引裡記錄的 roots,不是設定檔的 scan_root ——
         「更新」的語意是「把已經收錄的範圍再看一次」。這台的索引可能是用
@@ -931,16 +978,34 @@ class Win(QtWidgets.QMainWindow):
         """
         import argparse
 
+        if self._idx_t is not None and self._idx_t.isRunning():
+            if not auto:
+                self.set_status("索引正在更新中,請等它跑完")
+            return
+
         con = findpile.db_open()
-        roots = [r for r in findpile.roots_get(con) if os.path.isdir(r)]
+        allroots = findpile.roots_get(con)
+        roots = [r for r in allroots if os.path.isdir(r)]
         con.close()
+
+        # 索引記錄的資料夾一個都掛不上(外接碟沒插、網路碟沒連、資料夾
+        # 被改名)。**絕對不能退回去掃 DEFAULT_ROOT** —— 那是設定檔的
+        # scan_root,沒設時甚至是整顆磁碟。掃下去之後 cmd_index 會把它
+        # roots_add 進索引,以後每次「更新」都掃那裡,再也回不來;而且
+        # 掛不上的那批路徑會因為 os.path.exists 為 False 被整批刪掉。
+        #
+        # 這個守門原本寫在補預設值「之後」,所以永遠不會成立 —— 是死碼。
         if not roots:
-            roots = [findpile.DEFAULT_ROOT]
+            msg = ("索引記錄的資料夾現在都找不到:\n\n%s\n\n"
+                   "外接碟或網路碟沒連上嗎?這次不做任何更新。"
+                   % "\n".join(allroots or ["(索引裡沒有記錄)"]))
+            self.set_status("索引記錄的資料夾都找不到,這次不更新")
+            if not auto:
+                QtWidgets.QMessageBox.warning(self, "更新索引", msg)
+            return
 
         names = "、".join(findpile.split_display(r.rstrip("/" + os.sep))[1] or r
                           for r in roots)
-        if auto and not roots:
-            return                           # 根目錄都掛不上,這次什麼都別做
         if not auto and self._nstale == 0 and QtWidgets.QMessageBox.question(
                 self, "更新索引",
                 "剛才檢查過,沒有新增或修改過的檔案。\n還是要重新掃描一次嗎?",
@@ -960,6 +1025,9 @@ class Win(QtWidgets.QMainWindow):
         # 不該為了背景雜務等它。手動按的那次才鎖,因為那是他主動要的動作。
         if not auto:
             self.busy(True)
+        # 「自動那次不鎖按鈕」只該豁免搜尋,不該豁免索引按鈕自己 ——
+        # 不然畫面上還亮著「⟳ 更新索引 (1,234)」在催人按第二次。
+        self.btn_idx.setEnabled(False)
         self.prog.setVisible(True)
         self.prog.setRange(0, 0)             # 總量未知,先跑馬燈
         self.set_status("%s更新索引中:%s"
@@ -983,8 +1051,13 @@ class Win(QtWidgets.QMainWindow):
         if not auto:
             t.finished.connect(lambda: self.busy(False))
         t.line.connect(lambda s: s and self.set_status("更新索引:%s" % s))
+        t.finished.connect(self._idx_finished)
+        t.finished.connect(t.deleteLater)    # 不然每更新一次就留一個物件
         self._idx_t = t                      # 和搜尋的 _task 分開放
         t.start()
+
+    def _idx_finished(self):
+        self.btn_idx.setEnabled(True)
 
     def _reindex_failed(self, msg):
         # 自動更新失敗不要彈視窗擋在使用者面前 —— 他只是想開程式查東西
@@ -993,9 +1066,7 @@ class Win(QtWidgets.QMainWindow):
 
     def _reindexed(self, auto=False):
         self.prog.setVisible(False)
-        self.load_db()                       # 狀態列的筆數要跟著變
-        self._stale_at = 0
-        self.check_stale(force=True)         # 數字要歸零,不然按鈕一直掛著
+        self.load_db()                       # 狀態列的筆數要跟著變(含 check_stale)
         if self.kws and not self.img_mode:
             # 剛收進來的檔案要立刻找得到,不然使用者會以為沒更新到。
             # 自動那次也要重跑:開窗後一邊更新一邊搜尋是很自然的動作,

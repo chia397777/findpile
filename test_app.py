@@ -291,6 +291,104 @@ w._stale_done(0)
 chk("按鈕最後回到乾淨狀態", w.btn_idx.text() == "⟳ 更新索引")
 
 print("")
+print("2f. 資料保護(沙盒,不碰真索引)")
+import argparse as _ap
+import io as _io
+import shutil as _sh
+import tempfile as _tf
+
+_box = _tf.mkdtemp(prefix="lf_guard_")
+_img = os.path.join(_box, "收據.jpg")
+_pdf = os.path.join(_box, "掃描.pdf")
+_io.open(os.path.join(_box, "a.txt"), "w", encoding="utf-8").write("報價單 三萬")
+_io.open(_img, "wb").write(os.urandom(90000))
+_io.open(_pdf, "wb").write(b"%PDF-1.4 fake")
+_real_db = findpile.DB_PATH
+findpile.DB_PATH = os.path.join(_box, "idx.db")
+
+
+def _idx(full=False):
+    findpile.cmd_index(_ap.Namespace(root=_box, dir=None, mac=False, force=False,
+                                    full=full, all=False, scope=None,
+                                    quiet=False, workers=2), say=lambda *a: None)
+
+
+def _rec(p):
+    c = findpile.db_open()
+    r = c.execute("SELECT nchars,src FROM docs WHERE path=?", (p,)).fetchone()
+    c.close()
+    return r
+
+
+_idx()
+_c = findpile.db_open()
+for _p in (_img, _pdf):
+    _st = os.stat(_p)
+    _c.execute(findpile.DOCS_INSERT, (_p, _st.st_mtime, _st.st_size,
+                                     os.path.splitext(_p)[1], 58, "",
+                                     "收據 金額 12,000", "ocr-rapid"))
+_c.commit()
+_c.close()
+chk("OCR 紀錄灌得進去", _rec(_img) == (58, "ocr-rapid"), _rec(_img))
+
+_t = time.time() + 86400
+os.utime(_img, (_t, _t))
+os.utime(_pdf, (_t, _t))
+_idx()
+chk("圖片改動過,index 不覆蓋 OCR", _rec(_img) == (58, "ocr-rapid"), _rec(_img))
+chk("PDF 改動過,index 不用空白抽文覆蓋", _rec(_pdf) == (58, "ocr-rapid"), _rec(_pdf))
+
+_idx(full=True)
+chk("index --full 不刪 OCR 紀錄",
+    _rec(_img) == (58, "ocr-rapid") and _rec(_pdf) == (58, "ocr-rapid"),
+    "%s / %s" % (_rec(_img), _rec(_pdf)))
+
+# merge:舊的空白名稱紀錄不可以蓋掉現有的 OCR
+_old = os.path.join(_box, "old.db")
+_keep, findpile.DB_PATH = findpile.DB_PATH, _old
+_c = findpile.db_open()
+_st = os.stat(_img)
+_c.execute(findpile.DOCS_INSERT, (_img, _st.st_mtime, _st.st_size, ".jpg",
+                                 0, "", None, "name"))
+_c.commit()
+_c.close()
+findpile.DB_PATH = _keep
+findpile.cmd_merge(_ap.Namespace(db=_old, label=None, as_src=None))
+chk("merge 不讓名稱紀錄蓋掉 OCR", _rec(_img) == (58, "ocr-rapid"), _rec(_img))
+
+# 反向:真的刪掉的檔案還是要清掉,保護不能變成「什麼都不刪」
+os.remove(_img)
+_idx()
+chk("真的刪掉的檔案照樣清掉", _rec(_img) is None, _rec(_img))
+
+findpile.DB_PATH = _real_db
+_sh.rmtree(_box, ignore_errors=True)
+
+print("")
+print("2g. 並行與關窗防護")
+chk("有 closeEvent", hasattr(w, "closeEvent"))
+chk("更新索引有擋重入",
+    "isRunning" in __import__("inspect").getsource(w.reindex))
+chk("busy 不會在別人還在忙時解鎖",
+    "isRunning" in __import__("inspect").getsource(w.busy))
+chk("索引執行緒會 deleteLater",
+    "deleteLater" in __import__("inspect").getsource(w.reindex))
+# 根目錄都掛不上時不可以改掃別處 —— 用行為測,不是看原始碼。
+# 掃 DEFAULT_ROOT 的後果很嚴重:cmd_index 會把它 roots_add 進索引,
+# 以後每次更新都掃那裡;而掛不上的那批路徑會被整批判定成已刪除。
+_rg = findpile.roots_get
+findpile.roots_get = lambda _c: [os.path.join(os.sep, "這個路徑不存在_qq")]
+try:
+    w._idx_t = None
+    w.reindex(auto=True)                     # auto 才不會彈 modal 對話框
+    qapp.processEvents()
+    chk("根目錄掛不上就不做,不改掃別處",
+        w._idx_t is None, "狀態列:%s" % w.status.text()[:34])
+finally:
+    findpile.roots_get = _rg
+
+print("")
+print("")
 print("3. 強制渲染 —— TwoLine delegate 的 paint() 要真的跑過")
 pm = w.tbl.grab()
 chk("表格畫得出來", not pm.isNull() and pm.width() > 100,

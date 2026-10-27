@@ -205,6 +205,62 @@ score = total / (kb ** 0.75) + nmatch * 3.0
 
 ---
 
+## 設計:OCR 紀錄的保護
+
+OCR 很貴 —— 一張圖幾秒,整庫是十幾個小時。所以任何會「**覆蓋**」或
+「**刪除**」紀錄的路徑,都必須先問一句「這筆是不是 OCR 來的」。
+
+這條規則是踩出來的。先是 `index` 把全部 OCR 紀錄當成「檔案不見了」刪光;
+修掉之後派了兩個審查 agent 複查,**同一類的災難還有三條路徑沒堵住**,
+其中一條實測重現:
+
+```
+OCR 完成        (58, 'ocr-rapid')
+index --full    (0,  'name')      ← 辨識結果變成空白的名稱紀錄
+```
+
+| 路徑 | 怎麼壞 |
+|---|---|
+| `index --full` | `victims` 不分 `src`,OCR 一起刪;接著迴圈掃到同一批圖片、`known` 已經 pop 掉,於是寫回空白的名稱紀錄 |
+| `index`(一般) | 保護只做在 `EXT_NAME` 那一側。OCR 過的 **PDF** 在 `EXT_ALL` 裡,改動後直接進 `todo`,`extract()` 抽出空字串覆蓋掉辨識結果 |
+| `merge` | 無條件 `INSERT OR REPLACE`。把 OCR 之前打包出去的索引併回來,同一路徑的空白名稱紀錄會蓋掉現有的 OCR |
+| `cmd_ocr` | 自己寫了一份目錄剪枝,只比 `SKIP_DIRS` 成員,漏掉 `_skip_dir()` 的「`.` 開頭 / `$` 開頭 / macOS 套件後綴」。OCR 收了那些目錄,下次 `index` 判定該排除就整批刪掉 |
+
+根本原因不是四個獨立的疏忽,是「**什麼可以蓋掉什麼**」沒有一條統一的
+規則,四個地方各寫各的。改法就是把規則收成一個函式:
+
+```python
+def is_ocr(src):
+    return bool(src) and str(src).startswith("ocr")
+```
+
+**保護不等於什麼都不刪。** 測試裡有一條反向的:真的從磁碟刪掉的檔案
+(包含 OCR 過的圖)照樣要從索引清掉。
+
+### 搜尋端的一個判準錯誤
+
+`nameonly` 原本寫成 `src == "name"`。但「OCR 過卻一個字都沒讀到」的照片
+(`src='ocr-rapid'` 且 `nchars=0`,作者的庫裡有 215 張)會落到文件區,
+顯示成「命中 0 次 / 1K 字」。改成 `src == "name" or not nchars` ——
+語意是「沒有內文可以餵前後文面板的,就歸名稱區」。
+
+---
+
+## 設計:視窗的並行防護
+
+同一次複查在介面這半邊找到的:
+
+| | 症狀 |
+|---|---|
+| **守門是死碼** | `if not roots: roots = [DEFAULT_ROOT]` 寫在守門**之前**,所以 `if auto and not roots: return` 永遠不成立。外接碟沒插時會改掃 `DEFAULT_ROOT`,而且 `cmd_index` 會把它 `roots_add` 進索引 —— 以後每次更新都掃那裡 |
+| **可以同時跑兩個 `cmd_index`** | 自動更新期間刻意不鎖搜尋,結果連索引按鈕也沒鎖。兩個 writer 同時寫 WAL,各拿自己的快照算「哪些不見了」再 DELETE |
+| **`busy()` 是單一布林** | 更新完 → 自動重搜 → 更新那條的 `finished` 才送到 → 在搜尋還沒回來時把按鈕全開。進度條也會被別人收掉 |
+| **沒有 `closeEvent`** | 三條 Task 的 parent 都是視窗。自動更新是分鐘級的,那期間關窗就是 `QThread: Destroyed while thread is still running` |
+| **節流時間戳打在起點** | 掃描本身超過 60 秒時,之後每次切回視窗都已過門檻,等於連續不斷在掃 |
+| **`clicked.connect(self.reindex)`** | `clicked` 會把 `checked` 當第一個位置引數傳進去。現在是 `False`、剛好等於 `auto=False`,但那是運氣 |
+
+---
+
 ## 設計:索引過期會自己說
 
 索引是一份快照,不會自己更新。實際撞到的情形:存了一份新的 Word,
@@ -580,7 +636,7 @@ python test_app.py              關鍵字自動從你的索引裡挑一個
 python test_app.py 報價          指定關鍵字
 ```
 
-72 項離屏煙霧測試。重點是它會呼叫 `widget.grab()` **強制重繪**,
+88 項離屏煙霧測試。重點是它會呼叫 `widget.grab()` **強制重繪**,
 所以自訂的兩行繪製、縮圖縮放都會真的被執行,不是只驗「物件建起來了」。
 
 沒有索引、或沒有圖片特徵庫時會**講清楚原因然後正常結束**,不會假裝失敗。
@@ -690,7 +746,7 @@ findpile.py                  核心:索引、搜尋、OCR、排名。命令列�
 app.py                       搜尋視窗(新,PySide6)
 gui.py                       搜尋視窗(舊,Tkinter;不裝 PySide6 時的退路)
 imgfind.py                   以圖搜圖引擎(pHash + ORB + RANSAC)
-test_app.py                  離屏煙霧測試(72 項)
+test_app.py                  離屏煙霧測試(88 項)
 
 config.example.json          設定檔範本。複製成 config.json 再改
 _pick_python.sh              macOS:挑一個堪用的 python3
