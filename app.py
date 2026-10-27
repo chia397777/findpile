@@ -62,7 +62,7 @@ except Exception as _e:                             # noqa: BLE001
 
 # imgfind 掛掉時仍要判斷哪些結果是圖片,所以這份清單不能依賴它
 IMG_EXT = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp",
-           ".heic", ".heif"}
+           ".heic", ".heif", ".gif"}
 
 # ---------------------------------------------------------------- 外觀
 

@@ -230,7 +230,8 @@ EXT_PDF = {".pdf"}
 EXT_HTML = {".html", ".htm", ".xhtml"}
 EXT_PLAIN = {".txt", ".md", ".json", ".csv", ".tsv", ".jsx", ".rtf"}
 # 刻意不含 .py/.js/.xml/.log —— 這個資料夾裡有數千個程式庫檔案,會把搜尋結果洗掉。
-# 真要一起查:--include-code
+# (曾經想加一個 --include-code,沒做。要查程式碼請用 ripgrep 之類的工具,
+#  它們本來就比這個快。)
 EXT_ODF = {".odt", ".ods", ".odp"}
 EXT_ALL = EXT_OOXML | EXT_OLE2 | EXT_PDF | EXT_HTML | EXT_PLAIN | EXT_ODF
 
@@ -267,6 +268,9 @@ SKIP_DIRS |= set(CONFIG.get("skip_dirs") or ())      # 自己再加的
 SKIP_DIRS -= set(CONFIG.get("keep_dirs") or ())      # 把預設的某一個放行
 
 
+_SKIP_LOWER = {d.lower() for d in SKIP_DIRS}
+
+
 def _skip_dir(d):
     """
     這個資料夾名稱要不要整個跳過。
@@ -274,7 +278,9 @@ def _skip_dir(d):
     walk() 和 _is_skipped() 都用這一個函式 —— 兩邊各寫一份條件的話,
     改了排除規則之後「掃描時跳過」和「舊紀錄要清掉」就會對不起來。
     """
-    return (d in SKIP_DIRS
+    # 比小寫:Windows 的檔案系統不分大小寫,一個叫 Build 或 NODE_MODULES
+    # 的資料夾在這裡會被完整收錄進索引。
+    return (d.lower() in _SKIP_LOWER
             or d.startswith("$")
             or d.startswith(".")                     # 隱藏資料夾一律跳過
             or d.lower().endswith(SKIP_SUFFIX))      # macOS 套件
@@ -557,7 +563,12 @@ def _find_tesseract():
 
 TESSEXE = _find_tesseract()
 EXT_IMG = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp",
-           ".heic", ".heif"}      # HEIC 需要 pillow-heif,見 _heif()
+           ".heic", ".heif",      # HEIC 需要 pillow-heif,見 _heif()
+           ".gif"}                # 只做名稱紀錄與縮圖;以圖搜圖不收(見下)
+
+# .gif 刻意不進 imgfind 的副檔名清單:OpenCV 的 GIF 支援在各家編譯版本
+# 之間不一致,收進去只會在建特徵時一直丟讀取失敗。Qt 讀得了,所以縮圖
+# 和名稱搜尋照常。
 
 # 影片與音檔。抽不出內文,但「檔名和資料夾名稱」本身就是線索:
 # 2024尾牙/開場.mp4、客戶會議/0312錄音.m4a —— 名字裡就寫明了是什麼。
@@ -846,10 +857,19 @@ def cmd_ocr(args):
         con.executemany(DOCS_INSERT, rows)
     con.commit()
 
-    empty = sum(1 for r in rows if r[4] == 0)
+    # 辨識完一個字都沒讀到的有幾個。rows 在 flush 之後只剩尾批,
+    # 所以要查資料庫,不能數 rows ——「照 rows 數」是舊版留下來的死碼,
+    # 算出來的數字沒有意義,而且算完沒有任何地方用到。
+    empty = con.execute("SELECT COUNT(*) FROM docs"
+                        " WHERE src LIKE 'ocr%' AND nchars=0").fetchone()[0]
     con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     print("\nOCR 完成:%d 個檔案,耗時 %.1f 分,共辨識 %.1f 萬字。"
           % (len(todo), (time.time() - t0) / 60, nchars[0] / 10000))
+    if empty:
+        # 這個數字要講出來:辨識成功但一個字都沒讀到的照片(純風景、
+        # 手寫、太模糊),用關鍵字永遠找不到它們,只能靠檔名或以圖搜圖。
+        print("  其中 %s 個辨識後一個字都沒有(純照片或手寫,"
+              "關鍵字搜不到,只能靠檔名或以圖搜圖)。" % format(empty, ","))
     if fails:
         print("失敗 %d 個,前 3 個:" % len(fails))
         for p, e in fails[:3]:
@@ -1303,6 +1323,18 @@ def search(kws, mode="any", con=None, loose=False):
     """
     con = con or db_open()
     t0 = time.time()
+    # 去掉重複的關鍵字。counts 是 dict,重複的會 collapse 成一個,
+    # 但 nmatch / dmatch 是對 kws 逐一數 —— 查「繼承 繼承」會讓檔名
+    # 命中算成兩次,分數比只打一次高。
+    kws = list(dict.fromkeys(kws))
+
+    # SQLite 的 LIKE 對 ASCII 不分大小寫,但 Python 的 str.count 分。
+    # 不處理的話,一份內文只寫 pdf 的檔案會被 LIKE '%PDF%' 撈進候選,
+    # 卻因為 count('PDF') == 0 又被丟掉 —— 同一次搜尋兩套規則。
+    #
+    # 只在關鍵字含英文字母時才轉小寫:純中文查詢(最常見)一毛錢都不用付。
+    # 實測 670 萬字轉小寫再計數多 0.05 秒,而英文關鍵字的命中數會翻倍。
+    ci = any(c.isascii() and c.isalpha() for k in kws for c in k)
 
     if loose:
         # 先用「第一個二字組」粗篩,再逐檔做模糊計分
@@ -1328,9 +1360,13 @@ def search(kws, mode="any", con=None, loose=False):
     # 照片和影片都找得到)。資料夾名稱的資訊量很高,只比對 basename
     # 等於把一半的線索丟掉。順帶一提 `k in p` 比
     # `k in os.path.basename(p)` 快 50 倍:後者對每一列都要呼叫一次函式。
+    # 比對前先轉小寫。第一趟走 SQLite 的 LIKE,ASCII 預設不分大小寫,
+    # 所以查 invoice 找得到內文裡的 Invoice;這一趟如果分大小寫,
+    # 同一個查詢卻找不到檔名 Invoice.pdf —— 同一次搜尋兩套規則。
+    kl = [k.lower() for k in kws]
     for p, nchars, src, size, mt in con.execute(
             "SELECT path, nchars, src, size, mtime FROM docs"):
-        if p in hit or not any(k in p for k in kws):
+        if p in hit or not any(k in p.lower() for k in kl):
             continue
         if nchars:
             # 有內文、只是內文沒命中。前後文面板還是要有東西可顯示,
@@ -1343,14 +1379,18 @@ def search(kws, mode="any", con=None, loose=False):
 
     out = []
     for p, (text, nchars, src, size, mtime) in hit.items():
-        counts = {k: (_loose_count(text, k) if loose else text.count(k)) for k in kws}
+        hay = text.lower() if ci else text
+        counts = {k: (_loose_count(hay, k.lower() if ci else k) if loose
+                      else hay.count(k.lower() if ci else k)) for k in kws}
         total = sum(counts.values())
-        base = os.path.basename(p)
-        nmatch = sum(1 for k in kws if k in base)
+        base = os.path.basename(p).lower()
+        nmatch = sum(1 for k in kl if k in base)
         # 資料夾名稱命中的權重刻意壓低。查一個資料夾名會打到它底下
         # 幾千張照片,給它跟檔名一樣的 3.0 分,真正的文件會被全部壓下去。
-        dmatch = sum(1 for k in kws if k not in base and k in os.path.dirname(p))
-        if mode == "all" and not all(counts[k] or k in p for k in kws):
+        dmatch = sum(1 for k in kl
+                     if k not in base and k in os.path.dirname(p).lower())
+        if mode == "all" and not all(
+                counts[k] or k.lower() in p.lower() for k in kws):
             continue
         if total == 0 and nmatch == 0 and dmatch == 0:
             continue

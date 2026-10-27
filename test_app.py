@@ -365,6 +365,25 @@ findpile.DB_PATH = _real_db
 _sh.rmtree(_box, ignore_errors=True)
 
 print("")
+print("2f2. 搜尋規則的一致性")
+_c = findpile.db_open()
+_a, _ = findpile.search(["TXT"], "any", _c)
+_b, _ = findpile.search(["txt"], "any", _c)
+chk("英文關鍵字不分大小寫", len(_a) == len(_b), "%d / %d" % (len(_a), len(_b)))
+_one, _ = findpile.search([KW], "any", _c)
+_two, _ = findpile.search([KW, KW], "any", _c)
+chk("重複關鍵字不會灌水",
+    _one and _two and abs(_one[0]["score"] - _two[0]["score"]) < 1e-9,
+    "%.3f / %.3f" % (_one[0]["score"], _two[0]["score"]) if _one and _two else "")
+_c.close()
+chk("SKIP_DIRS 不分大小寫",
+    all(findpile._skip_dir(d) for d in ("build", "Build", "BUILD", "NODE_MODULES"))
+    and not findpile._skip_dir("文件"))
+chk(".gif 收得進索引,縮圖也認得",
+    ".gif" in findpile.EXT_IMG and ".gif" in findpile.EXT_NAME
+    and A.is_img("a.GIF"))
+
+print("")
 print("2g. 並行與關窗防護")
 chk("有 closeEvent", hasattr(w, "closeEvent"))
 chk("更新索引有擋重入",
