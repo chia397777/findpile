@@ -235,12 +235,23 @@ EXT_ODF = {".odt", ".ods", ".odp"}
 EXT_ALL = EXT_OOXML | EXT_OLE2 | EXT_PDF | EXT_HTML | EXT_PLAIN | EXT_ODF
 
 # 不掃的目錄
+#
+# 編譯產物(build / Pods / DerivedData)是後來才加的。它們裡面是成千上萬個
+# .json / .txt,全部是機器產生的中間檔,一個都不是你會想搜的東西,卻會把
+# 真正的文件稀釋掉 (一個 Flutter 專案的 build 底下就能有好幾千個 Gradle 記錄檔)。
+#
+# 以 .、$ 開頭的資料夾另外由 _skip_dir() 一律跳過,所以 .gradle、.dart_tool、
+# .idea、.next 不必列在這裡。
+#
+# 真的有一個叫 build 的資料夾要收:config.json 裡寫 "keep_dirs": ["build"]。
 SKIP_DIRS = {"node_modules", ".git", ".venv", "venv", "__pycache__",
+             "build", "Pods", "DerivedData",
              ".claude", "_findpile", "$RECYCLE.BIN", "System Volume Information",
              # --- macOS ---
              "Library",          # 應用程式資料與快取,幾十萬個檔案,沒有要搜的東西
              "Applications", "Applications (Parallels)",
              ".Trash", ".Spotlight-V100", ".fseventsd", ".DocumentRevisions-V100"}
+
 
 # 這些是 macOS 的「套件」—— 看起來是一個檔案,實際上是資料夾。
 # 不排除的話會爬進上萬個內部資源檔。
@@ -251,6 +262,23 @@ SKIP_SUFFIX = (".app", ".photoslibrary", ".musiclibrary", ".tvlibrary",
                # iWork 與 RTFD 在檔案系統上其實是資料夾。爬進去只會抽到
                # 一堆叫 TXT.rtf / index.xml 的內部檔,看不出原本是哪份文件。
                ".pages", ".numbers", ".key", ".rtfd", ".scriv")
+
+SKIP_DIRS |= set(CONFIG.get("skip_dirs") or ())      # 自己再加的
+SKIP_DIRS -= set(CONFIG.get("keep_dirs") or ())      # 把預設的某一個放行
+
+
+def _skip_dir(d):
+    """
+    這個資料夾名稱要不要整個跳過。
+
+    walk() 和 _is_skipped() 都用這一個函式 —— 兩邊各寫一份條件的話,
+    改了排除規則之後「掃描時跳過」和「舊紀錄要清掉」就會對不起來。
+    """
+    return (d in SKIP_DIRS
+            or d.startswith("$")
+            or d.startswith(".")                     # 隱藏資料夾一律跳過
+            or d.lower().endswith(SKIP_SUFFIX))      # macOS 套件
+
 
 # `index --mac` 的預設範圍。不整顆 ~ 掃是因為 ~/Library 底下有幾十萬個
 # 應用程式檔案,掃它只是浪費時間。iCloud 雲碟在 Library 底下,所以
@@ -919,11 +947,7 @@ def walk(root, errors=None, cloud=None):
             errors.append(e)
 
     for dp, dn, fn in os.walk(root, onerror=_onerror):
-        dn[:] = [d for d in dn
-                 if d not in SKIP_DIRS
-                 and not d.startswith("$")
-                 and not d.startswith(".")                  # 隱藏資料夾一律跳過
-                 and not d.lower().endswith(SKIP_SUFFIX)]   # macOS 套件
+        dn[:] = [d for d in dn if not _skip_dir(d)]
         if cloud is not None:
             for f in fn:
                 if f.startswith(".") and f.endswith(".icloud"):
@@ -980,6 +1004,15 @@ def guard_roots(roots):
         else:
             ok.append(r)
     return ok
+
+
+def _is_skipped(p, root):
+    """這個檔案現在是不是落在被排除的資料夾底下(只看中間的目錄名)。"""
+    try:
+        rel = os.path.relpath(p, root)
+    except ValueError:                   # Windows 跨磁碟,算不出相對路徑
+        return False
+    return any(_skip_dir(d) for d in rel.split(os.sep)[:-1])
 
 
 def is_borrowed_root(root):
@@ -1081,9 +1114,13 @@ def cmd_index(args):
             # 判定標準因此從「這次沒掃到」改成「磁碟上真的不存在」,
             # 這也讓刪除行為整體更保守。多出來的 stat 呼叫只發生在
             # 候選名單上,幾千筆不到一秒。
+            #
+            # 第二個理由:檔案還在,但現在已經不收錄了 —— 例如把 build
+            # 加進 SKIP_DIRS 之後,那底下幾千筆編譯產物就該清掉。少了
+            # 這一條,改排除規則永遠不會生效,只能整個 --full 重建。
             gone += [p for p in known
                      if p not in here and p not in cloud and _under(p, root)
-                     and not os.path.exists(p)]
+                     and (not os.path.exists(p) or _is_skipped(p, root))]
         found |= here
         roots_add(con, root)
 

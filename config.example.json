@@ -22,5 +22,11 @@
   "ocr_scopes": {
     "掃描件": ["掃描/2024", "掃描/2025"],
     "截圖": ["手機截圖"]
-  }
+  },
+
+  "_skip_dirs": "再多排除幾個資料夾名稱。預設已含 node_modules、build、Pods、DerivedData,以及所有 . 開頭的資料夾",
+  "skip_dirs": [],
+
+  "_keep_dirs": "把預設排除的某一個放行。例如你真的有一個叫 build 的資料夾要收:[\"build\"]",
+  "keep_dirs": []
 }
